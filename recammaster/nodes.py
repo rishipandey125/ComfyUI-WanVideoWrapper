@@ -43,7 +43,7 @@ class WanVideoReCamMasterCameraEmbed:
         import json
         from einops import rearrange
         
-        camera_data_path = os.path.join(script_directory, "camera_extrinsics.json")
+        camera_data_path = os.path.join(script_directory, "recam_extrinsics.json")
         with open(camera_data_path, 'r') as file:
             cam_data = json.load(file)
         
@@ -66,6 +66,61 @@ class WanVideoReCamMasterCameraEmbed:
 
         cam_idx = list(range(num_frames))[::4]
         traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{int(camera_type_map[camera_type]):02d}"]) for idx in cam_idx]
+
+        def generate_orbit_180(num_frames=81):
+            camera_data = {}
+            radius = 100  # Distance from center during orbit
+            center = np.array([3390, 1380, 240])  # Center point of orbit
+            
+            # Arc movement similar to arc_left/arc_right but spanning 180 degrees
+            for i in range(num_frames):
+                # Calculate angle from 0 to 180 degrees
+                angle = i * 90.0 / (num_frames - 1)
+                angle_rad = np.radians(angle)
+                
+                # Calculate position - circular path around center
+                x = center[0] + radius * np.cos(angle_rad)
+                y = center[1] + radius * np.sin(angle_rad)
+                z = center[2]  # Z stays constant
+                pos = np.array([x, y, z])
+                
+                # Calculate direction from camera to center point
+                dir_to_center = center - pos
+                dir_to_center_xy = dir_to_center.copy()
+                dir_to_center_xy[2] = 0  # Project to XY plane for horizontal orientation
+                
+                # Normalize the direction vector
+                dir_to_center_xy = dir_to_center_xy / np.linalg.norm(dir_to_center_xy)
+                
+                # For camera to face center, forward vector should be this direction
+                # The rotation matrix needs to make the camera's forward vector (local Z) 
+                # point toward the center
+                
+                # Calculate the angle between the camera and center in the XY plane
+                # This is the negative angle we need to rotate camera to face center
+                look_angle = np.arctan2(dir_to_center_xy[1], dir_to_center_xy[0])
+                
+                # Rotation matrix for facing the center
+                cos_look = np.cos(look_angle)
+                sin_look = np.sin(look_angle)
+                
+                # Format string with rotation that makes camera face the center
+                matrix_str = f"[{cos_look} {sin_look} 0 0] "
+                matrix_str += f"[{-sin_look} {cos_look} 0 0] "
+                matrix_str += f"[0 0 1 0] "
+                matrix_str += f"[{x} {y} {z} 1] "
+                
+                # Store the camera string
+                frame_key = f"frame{i}"
+                if frame_key not in camera_data:
+                    camera_data[frame_key] = {}
+                camera_data[frame_key]["cam11"] = matrix_str
+            return camera_data
+
+        # Generate the orbit camera data
+        #traj = [self.parse_matrix(generate_orbit_180(num_frames=81)[f"frame{idx}"][f"cam{int(11):02d}"]) for idx in cam_idx]
+        #print(traj)
+        
         traj = np.stack(traj).transpose(0, 2, 1)
         c2ws = []
         for c2w in traj:
@@ -94,6 +149,88 @@ class WanVideoReCamMasterCameraEmbed:
         }
 
         return (embeds, traj,)
+    
+class WanVideoSynCamMasterCameraEmbed:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
+            "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
+            "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
+           
+            "camera_type": ([
+                "azimuth", 
+                "elevation",
+                "distance",
+                ], {"tooltip": "Camera type to use"}),
+        },
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS", "CAMERAPOSES",)
+    RETURN_NAMES = ("camera_embeds", "camera_poses",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "https://github.com/KwaiVGI/ReCamMaster"
+
+    def process(self, width, height, num_frames, camera_type):
+        # load camera
+        import json
+        from einops import rearrange
+        
+        camera_data_path = os.path.join(script_directory, "syncam_extrinsics.json")
+        with open(camera_data_path, 'r') as file:
+            cam_data = json.load(file)
+
+        # load camera
+        multiview_c2ws = []
+        cam_idx = list(range(num_frames))[::4]
+
+        traj_list = []
+
+        if camera_type == "azimuth":
+            tgt_idx = 1
+            cond_idx = 3
+        elif camera_type == "elevation":
+            tgt_idx = 3
+            cond_idx = 7
+        elif camera_type == "distance":
+            tgt_idx = 9
+            cond_idx = 10
+        for view_idx in [cond_idx, tgt_idx]:
+            traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{view_idx:02d}"]) for idx in cam_idx]
+            traj = np.stack(traj).transpose(0, 2, 1)
+            traj_list.append(traj)
+
+            c2ws = []
+            for c2w in traj:
+                c2w = c2w[:, [1, 2, 0, 3]]
+                c2w[:3, 1] *= -1.
+                c2w[:3, 3] /= 200
+                c2ws.append(c2w)
+            multiview_c2ws.append(c2ws)
+        cond_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[0]]
+        tgt_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[1]]
+        relative_poses = []
+        for i in range(len(tgt_cam_params)):
+            relative_pose = self.get_relative_pose([tgt_cam_params[i], cond_cam_params[i]])
+            relative_poses.append(torch.as_tensor(relative_pose)[:,:3,:])
+        pose_embedding = torch.stack(relative_poses, dim=1)  # v,21,3,4
+        pose_embedding = rearrange(pose_embedding, 'v f c d -> v f (c d)')
+
+        vae_stride = (4, 8, 8)
+        target_shape = (16, (num_frames - 1) // vae_stride[0] + 1,
+                        height // vae_stride[1],
+                        width // vae_stride[2])
+
+        embeds = {
+            "target_shape": target_shape,
+            "num_frames": num_frames,
+            "syncammaster": {
+                "camera_embed": pose_embedding,
+            }
+        }
+
+        return (embeds, np.concatenate(traj_list),)
     
     def parse_matrix(self, matrix_str):
         rows = matrix_str.strip().split('] [')
@@ -274,8 +411,10 @@ or a .txt file with RealEstate camera intrinsics and coordinates, in a 3D plot.
 NODE_CLASS_MAPPINGS = {
     "WanVideoReCamMasterCameraEmbed": WanVideoReCamMasterCameraEmbed,
     "ReCamMasterPoseVisualizer": ReCamMasterPoseVisualizer,
+    "WanVideoSynCamMasterCameraEmbed": WanVideoSynCamMasterCameraEmbed,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoReCamMasterCameraEmbed": "WanVideo ReCamMaster Camera Embed",
     "ReCamMasterPoseVisualizer": "ReCamMaster Pose Visualizer",
+    "WanVideoSynCamMasterCameraEmbed": "WanVideo SyncamMaster Camera Embed",
     }

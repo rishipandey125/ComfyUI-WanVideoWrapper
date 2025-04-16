@@ -455,7 +455,8 @@ class WanAttentionBlock(nn.Module):
         video_attention_split_steps=[],
         rope_func = "default",
         clip_embed=None,
-        camera_embed=None
+        camera_embed=None,
+        freqs_mvs=None,
         
     ):
         r"""
@@ -466,10 +467,11 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        e = (self.modulation.to(e.device) + e).chunk(6, dim=1)
-        input_x = self.norm1(x) * (1 + e[1]) + e[0]
+        e_mod = (self.modulation.to(e.device) + e).chunk(6, dim=1)
+        input_x = self.norm1(x) * (1 + e_mod[1]) + e_mod[0]
 
-        if camera_embed is not None:
+        if camera_embed is not None and not hasattr(self, 'mvs_attn'):
+            print("ReCamMaster camera embedding")
             # encode ReCamMaster camera
             camera_embed = self.cam_encoder(camera_embed.to(x))
             camera_embed = camera_embed.repeat(1, 2, 1)
@@ -479,6 +481,7 @@ class WanAttentionBlock(nn.Module):
 
         # self-attention
         if (context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1)) and x.shape[0] == 1:
+            print("Attention split")
             y = self.self_attn.forward_split(
             input_x, 
             seq_lens, grid_sizes,
@@ -494,16 +497,36 @@ class WanAttentionBlock(nn.Module):
             freqs, rope_func=rope_func
             )
         #ReCamMaster
-        if camera_embed is not None:
+        if camera_embed is not None and not hasattr(self, 'mvs_attn'):
+            print("ReCamMaster camera embedding")
             y = self.projector(y)
 
-        x = x.to(torch.float32) + (y.to(torch.float32) * e[2].to(torch.float32))
+        x = x.to(torch.float32) + (y.to(torch.float32) * e_mod[2].to(torch.float32))
+
+        if hasattr(self, 'mvs_attn'):
+            shift_mvs, scale_mvs, gate_mvs = (
+                self.modulation_mvs.to(e.device) + e[:, :3, :]).chunk(3, dim=1)
+            input_x = self.norm_mvs(x) * (1 + scale_mvs) + shift_mvs
+            v, f, _ = camera_embed.shape
+            h, w = 30, 52  # h, w  hard code
+            camera_embed = self.cam_encoder(camera_embed.to(x))
+            camera_embed = camera_embed.unsqueeze(2).unsqueeze(3).repeat(1, 1, h, w, 1)
+            camera_embed = rearrange(camera_embed, 'b f h w d -> b (f h w) d')
+            input_x += camera_embed
+            x = rearrange(x, '(b v) (f h w) d -> (b f) (v h w) d', v=v, f=f, h=h, w=w)
+            input_x = rearrange(input_x, '(b v) (f h w) d -> (b f) (v h w) d', v=v, f=f, h=h, w=w)
+            mvs_attn = self.mvs_attn(
+                input_x,
+                seq_lens, grid_sizes, 
+                freqs_mvs, rope_func="comfy")
+            x = x + gate_mvs.to(torch.float32) * self.projector(mvs_attn)
+            x = rearrange(x, '(b f) (v h w) d -> (b v) (f h w) d', v=v, f=f, h=h, w=w)
 
         # cross-attention & ffn function
         if (context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1)) and x.shape[0] == 1:
-            x = self.split_cross_attn_ffn(x, context, context_lens, e, clip_embed=clip_embed, grid_sizes=grid_sizes)
+            x = self.split_cross_attn_ffn(x, context, context_lens, e_mod, clip_embed=clip_embed, grid_sizes=grid_sizes)
         else:
-            x = self.cross_attn_ffn(x, context, context_lens, e, clip_embed=clip_embed, grid_sizes=grid_sizes)
+            x = self.cross_attn_ffn(x, context, context_lens, e_mod, clip_embed=clip_embed, grid_sizes=grid_sizes)
 
         return x
     
@@ -1020,6 +1043,8 @@ class WanModel(ModelMixin, ConfigMixin):
                       dim=1) for u in x
         ])
 
+        freqs_mvs = None
+
         if freqs is None: #comfy rope
             rope_func = "comfy"
             f_len = ((F + (self.patch_size[0] // 2)) // self.patch_size[0])
@@ -1032,6 +1057,17 @@ class WanModel(ModelMixin, ConfigMixin):
             img_ids = repeat(img_ids, "t h w c -> b (t h w) c", b=1)
 
             freqs = self.rope_embedder(img_ids).movedim(1, 2)
+
+            if hasattr(self.blocks[0], "mvs_attn"): #syncammaster
+                # Create freqs_mvs with fixed temporal dimension v=2
+                v = 2
+                img_ids_mvs = torch.zeros((v, h_len, w_len, 3), device=x.device, dtype=x.dtype)
+                img_ids_mvs[:, :, :, 0] = img_ids_mvs[:, :, :, 0] + torch.linspace(0, v - 1, steps=v, device=x.device, dtype=x.dtype).reshape(-1, 1, 1)
+                img_ids_mvs[:, :, :, 1] = img_ids_mvs[:, :, :, 1] + torch.linspace(0, h_len - 1, steps=h_len, device=x.device, dtype=x.dtype).reshape(1, -1, 1)
+                img_ids_mvs[:, :, :, 2] = img_ids_mvs[:, :, :, 2] + torch.linspace(0, w_len - 1, steps=w_len, device=x.device, dtype=x.dtype).reshape(1, 1, -1)
+                img_ids_mvs = repeat(img_ids_mvs, "t h w c -> b (t h w) c", b=1)
+                
+                freqs_mvs = self.rope_embedder(img_ids_mvs).movedim(1, 2)
         else:
             rope_func = "default"
 
@@ -1122,6 +1158,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 current_step=current_step,
                 video_attention_split_steps=self.video_attention_split_steps,
                 camera_embed=camera_embed,
+                freqs_mvs=freqs_mvs,
                 )
             
             if vace_data is not None:
