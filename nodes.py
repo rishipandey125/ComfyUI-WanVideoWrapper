@@ -3366,14 +3366,14 @@ class WanVideoBidirectionalCombiner:
         forward_frames = forward_images[:forward_original_frames]
         reverse_frames = reverse_images[:reverse_original_frames]
         
-        # Reverse the forward sequence back to original order
-        forward_frames = forward_frames.flip(0)
+        # Reverse the reverse sequence back to original order
+        reverse_frames = reverse_frames.flip(0)
         
-        # Skip the duplicate center frame in reverse sequence
-        reverse_frames = reverse_frames[1:]
+        # Remove the overlapping frame (start_frame) from the forward sequence
+        forward_frames = forward_frames[1:]
         
-        # Combine sequences
-        combined = torch.cat([forward_frames, reverse_frames], dim=0)
+        # Combine sequences: reverse first (beginning to start_frame), then forward (start_frame+1 to end)
+        combined = torch.cat([reverse_frames, forward_frames], dim=0)
             
         return (combined,)
 
@@ -3393,9 +3393,11 @@ class WanVideoBidirectionalSplit:
     DESCRIPTION = "Splits and pads image sequence for bidirectional processing"
 
     def process(self, images, start_frame_index):
-        # Split images at start_frame_index
-        forward_images = images[:start_frame_index + 1]  # Include the split frame
-        reverse_images = images[start_frame_index:].flip(0)  # Include the split frame and reverse
+        # Split images for forward and reverse passes
+        # Forward pass: start_frame to end (in original order)
+        forward_images = images[start_frame_index:]
+        # Reverse pass: start_frame to beginning (in reverse order)
+        reverse_images = images[:start_frame_index + 1].flip(0)
         
         # Calculate original frame counts
         forward_original_frames = forward_images.shape[0]
@@ -3414,13 +3416,13 @@ class WanVideoBidirectionalSplit:
         
         # Pad the images to match the padded frame counts
         if forward_padded_frames > forward_original_frames:
-            padding = torch.zeros((forward_padded_frames - forward_original_frames, *forward_images.shape[1:]), 
-                                device=forward_images.device, dtype=forward_images.dtype)
+            # Pad forward sequence with repeated last frame
+            padding = forward_images[-1:].repeat(forward_padded_frames - forward_original_frames, 1, 1, 1)
             forward_images = torch.cat([forward_images, padding], dim=0)
             
         if reverse_padded_frames > reverse_original_frames:
-            padding = torch.zeros((reverse_padded_frames - reverse_original_frames, *reverse_images.shape[1:]), 
-                                device=reverse_images.device, dtype=reverse_images.dtype)
+            # Pad reverse sequence with repeated last frame
+            padding = reverse_images[-1:].repeat(reverse_padded_frames - reverse_original_frames, 1, 1, 1)
             reverse_images = torch.cat([reverse_images, padding], dim=0)
             
         return (forward_images, reverse_images, forward_padded_frames, reverse_padded_frames, 
