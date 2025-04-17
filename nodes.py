@@ -3231,6 +3231,198 @@ class WanVideoEncode:
  
         return ({"samples": latents, "mask": latent_mask},)
 
+class WanVideoBidirectionalSampler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("WANVIDEOMODEL",),
+                "text_embeds": ("WANVIDEOTEXTEMBEDS", ),
+                "forward_image_embeds": ("WANVIDIMAGE_EMBEDS", ),
+                "reverse_image_embeds": ("WANVIDIMAGE_EMBEDS", ),
+                "start_frame_index": ("INT", {"default": 49, "min": 0, "max": 300, "step": 1, "tooltip": "Index of the frame to start from (0 for forward only, last frame for reverse only)"}),
+                "total_frames": ("INT", {"default": 100, "min": 1, "max": 300, "step": 1, "tooltip": "Total number of frames in the video"}),
+                "steps": ("INT", {"default": 30, "min": 1}),
+                "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
+                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Moves the model to the offload device after sampling"}),
+                "scheduler": (["unipc", "unipc/beta", "dpm++", "dpm++/beta","dpm++_sde", "dpm++_sde/beta", "euler", "euler/beta", "deis"],
+                    {
+                        "default": 'unipc'
+                    }),
+                "riflex_freq_index": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1, "tooltip": "Frequency index for RIFLEX, disabled when 0, default 6. Allows for new frames to be generated after without looping"}),
+            },
+            "optional": {
+                "samples": ("LATENT", {"tooltip": "init Latents to use for video2video process"} ),
+                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "feta_args": ("FETAARGS", ),
+                "context_options": ("WANVIDCONTEXT", ),
+                "teacache_args": ("TEACACHEARGS", ),
+                "flowedit_args": ("FLOWEDITARGS", ),
+                "batched_cfg": ("BOOLEAN", {"default": False, "tooltip": "Batch cond and uncond for faster sampling, possibly faster on some hardware, uses more memory"}),
+                "slg_args": ("SLGARGS", ),
+                "rope_function": (["default", "comfy"], {"default": "comfy", "tooltip": "Comfy's RoPE implementation doesn't use complex numbers and can thus be compiled, that should be a lot faster when using torch.compile"}),
+                "loop_args": ("LOOPARGS", ),
+                "experimental_args": ("EXPERIMENTALARGS", ),
+                "sigmas": ("SIGMAS", ),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", "LATENT", "INT", "INT")
+    RETURN_NAMES = ("forward_samples", "reverse_samples", "forward_frames", "reverse_frames")
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Bidirectional video sampler that handles forward and reverse generation with frame padding"
+
+    def process(self, model, text_embeds, forward_image_embeds, reverse_image_embeds, start_frame_index, total_frames, 
+                shift, steps, cfg, seed, scheduler, riflex_freq_index, force_offload=True, samples=None, 
+                feta_args=None, denoise_strength=1.0, context_options=None, teacache_args=None, 
+                flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", 
+                loop_args=None, experimental_args=None, sigmas=None):
+        
+        # Calculate frame counts for forward and reverse passes
+        forward_frames = total_frames - start_frame_index
+        reverse_frames = start_frame_index + 1  # +1 to include the start frame
+        
+        # Pad frames to nearest 4n+1
+        def pad_frames(n):
+            remainder = (n - 1) % 4
+            if remainder != 0:
+                return n + (4 - remainder)
+            return n
+        
+        # Determine which direction needs padding
+        if start_frame_index == 0:
+            # Only forward pass
+            forward_frames = pad_frames(forward_frames)
+            reverse_frames = 0
+        elif start_frame_index == total_frames - 1:
+            # Only reverse pass
+            forward_frames = 0
+            reverse_frames = pad_frames(reverse_frames)
+        else:
+            # Both directions, pad the longer one
+            if forward_frames > reverse_frames:
+                forward_frames = pad_frames(forward_frames)
+            else:
+                reverse_frames = pad_frames(reverse_frames)
+        
+        # Create forward samples if needed
+        forward_samples = None
+        if forward_frames > 0:
+            forward_sampler = WanVideoSampler()
+            forward_samples = forward_sampler.process(
+                model=model,
+                text_embeds=text_embeds,
+                image_embeds=forward_image_embeds,
+                shift=shift,
+                steps=steps,
+                cfg=cfg,
+                seed=seed,
+                scheduler=scheduler,
+                riflex_freq_index=riflex_freq_index,
+                force_offload=force_offload,
+                samples=samples,
+                feta_args=feta_args,
+                denoise_strength=denoise_strength,
+                context_options=context_options,
+                teacache_args=teacache_args,
+                flowedit_args=flowedit_args,
+                batched_cfg=batched_cfg,
+                slg_args=slg_args,
+                rope_function=rope_function,
+                loop_args=loop_args,
+                experimental_args=experimental_args,
+                sigmas=sigmas
+            )[0]
+        
+        # Create reverse samples if needed
+        reverse_samples = None
+        if reverse_frames > 0:
+            reverse_sampler = WanVideoSampler()
+            reverse_samples = reverse_sampler.process(
+                model=model,
+                text_embeds=text_embeds,
+                image_embeds=reverse_image_embeds,
+                shift=shift,
+                steps=steps,
+                cfg=cfg,
+                seed=seed,
+                scheduler=scheduler,
+                riflex_freq_index=riflex_freq_index,
+                force_offload=force_offload,
+                samples=samples,
+                feta_args=feta_args,
+                denoise_strength=denoise_strength,
+                context_options=context_options,
+                teacache_args=teacache_args,
+                flowedit_args=flowedit_args,
+                batched_cfg=batched_cfg,
+                slg_args=slg_args,
+                rope_function=rope_function,
+                loop_args=loop_args,
+                experimental_args=experimental_args,
+                sigmas=sigmas
+            )[0]
+        
+        return (forward_samples, reverse_samples, forward_frames, reverse_frames)
+
+
+class WanVideoBidirectionalCombiner:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "forward_samples": ("LATENT", {"tooltip": "Forward pass samples"}),
+            "reverse_samples": ("LATENT", {"tooltip": "Reverse pass samples"}),
+            "forward_frames": ("INT", {"tooltip": "Number of frames in forward pass"}),
+            "reverse_frames": ("INT", {"tooltip": "Number of frames in reverse pass"}),
+            "start_frame_index": ("INT", {"default": 49, "min": 0, "max": 300, "step": 1, 
+                "tooltip": "Original start frame index used in generation"}),
+            "total_frames": ("INT", {"default": 100, "min": 1, "max": 300, "step": 1,
+                "tooltip": "Original total frames requested"}),
+        }}
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("combined_samples",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Combines and trims bidirectional video samples to the correct length"
+
+    def process(self, forward_samples, reverse_samples, forward_frames, reverse_frames, start_frame_index, total_frames):
+        import torch
+        
+        # Calculate actual frame counts needed (without padding)
+        actual_forward = total_frames - start_frame_index if start_frame_index < total_frames else 0
+        actual_reverse = start_frame_index + 1 if start_frame_index > 0 else 0  # +1 to include start frame
+
+        # Initialize the output tensor
+        if forward_samples is not None:
+            device = forward_samples["samples"].device
+            dtype = forward_samples["samples"].dtype
+        else:
+            device = reverse_samples["samples"].device
+            dtype = reverse_samples["samples"].dtype
+
+        combined = torch.zeros((1, 4, total_frames, forward_samples["samples"].shape[3], forward_samples["samples"].shape[4]), 
+                             device=device, dtype=dtype)
+
+        # Handle reverse frames (they need to be reversed in order)
+        if reverse_frames > 0:
+            reverse_data = reverse_samples["samples"]
+            # Only take the frames we need, and reverse their order
+            reverse_data = reverse_data[:, :, :actual_reverse].flip(2)
+            combined[:, :, :actual_reverse] = reverse_data
+
+        # Handle forward frames
+        if forward_frames > 0:
+            forward_data = forward_samples["samples"]
+            # Only take the frames we need
+            forward_data = forward_data[:, :, :actual_forward]
+            combined[:, :, start_frame_index:start_frame_index + actual_forward] = forward_data
+
+        return ({"samples": combined},)
+
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
     "WanVideoDecode": WanVideoDecode,
@@ -3264,7 +3456,9 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoVACEEncode": WanVideoVACEEncode,
     "WanVideoVACEStartToEndFrame": WanVideoVACEStartToEndFrame,
     "WanVideoVACEModelSelect": WanVideoVACEModelSelect,
-    }
+    "WanVideoBidirectionalSampler": WanVideoBidirectionalSampler,
+    "WanVideoBidirectionalCombiner": WanVideoBidirectionalCombiner,
+}
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
     "WanVideoDecode": "WanVideo Decode",
@@ -3299,4 +3493,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoVACEEncode": "WanVideo VACE Encode",
     "WanVideoVACEStartToEndFrame": "WanVideo VACE Start To End Frame",
     "WanVideoVACEModelSelect": "WanVideo VACE Model Select",
-    }
+    "WanVideoBidirectionalSampler": "WanVideo Bidirectional Sampler",
+    "WanVideoBidirectionalCombiner": "WanVideo Bidirectional Combiner",
+}
