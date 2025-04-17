@@ -3243,6 +3243,8 @@ class WanVideoBidirectionalSampler:
                 "start_frame_index": ("INT", {"default": 49, "min": 0, "max": 300, "step": 1, "tooltip": "Index of the frame to start from (0 for forward only, last frame for reverse only)"}),
                 "forward_frames": ("INT", {"default": 49, "min": 1, "max": 300, "step": 1, "tooltip": "Number of frames in forward pass (including padding)"}),
                 "reverse_frames": ("INT", {"default": 49, "min": 1, "max": 300, "step": 1, "tooltip": "Number of frames in reverse pass (including padding)"}),
+                "forward_only": ("BOOLEAN", {"default": False, "tooltip": "Set to true if this is a forward-only pass"}),
+                "reverse_only": ("BOOLEAN", {"default": False, "tooltip": "Set to true if this is a reverse-only pass"}),
                 "steps": ("INT", {"default": 30, "min": 1}),
                 "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
                 "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
@@ -3277,21 +3279,20 @@ class WanVideoBidirectionalSampler:
     DESCRIPTION = "Bidirectional video sampler that handles forward and reverse generation with frame padding"
 
     def process(self, model, text_embeds, forward_image_embeds, reverse_image_embeds, start_frame_index, 
-                forward_frames, reverse_frames, shift, steps, cfg, seed, scheduler, riflex_freq_index, 
+                forward_frames, reverse_frames, forward_only, reverse_only, shift, steps, cfg, seed, scheduler, riflex_freq_index, 
                 force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None, 
                 teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", 
                 loop_args=None, experimental_args=None, sigmas=None):
         
         # Create forward samples if needed
-        forward_samples = None
-        if start_frame_index > 0:
+        if not reverse_only:
             forward_samples = WanVideoSampler().process(
                 model=model,
                 text_embeds=text_embeds,
                 image_embeds=forward_image_embeds,
+                shift=shift,
                 steps=steps,
                 cfg=cfg,
-                shift=shift,
                 seed=seed,
                 scheduler=scheduler,
                 riflex_freq_index=riflex_freq_index,
@@ -3309,17 +3310,44 @@ class WanVideoBidirectionalSampler:
                 experimental_args=experimental_args,
                 sigmas=sigmas
             )[0]
+        else:
+            # For reverse-only case, create a single frame latent to satisfy the decoder
+            forward_samples = WanVideoSampler().process(
+                model=model,
+                text_embeds=text_embeds,
+                image_embeds=forward_image_embeds,
+                shift=shift,
+                steps=steps,
+                cfg=cfg,
+                seed=seed,
+                scheduler=scheduler,
+                riflex_freq_index=riflex_freq_index,
+                force_offload=force_offload,
+                samples=samples,
+                denoise_strength=denoise_strength,
+                feta_args=feta_args,
+                context_options=context_options,
+                teacache_args=teacache_args,
+                flowedit_args=flowedit_args,
+                batched_cfg=batched_cfg,
+                slg_args=slg_args,
+                rope_function=rope_function,
+                loop_args=loop_args,
+                experimental_args=experimental_args,
+                sigmas=sigmas
+            )[0]
+            # Trim to single frame
+            forward_samples["samples"] = forward_samples["samples"][:1]
 
         # Create reverse samples if needed
-        reverse_samples = None
-        if start_frame_index < forward_frames - 1:
+        if not forward_only:
             reverse_samples = WanVideoSampler().process(
                 model=model,
                 text_embeds=text_embeds,
                 image_embeds=reverse_image_embeds,
+                shift=shift,
                 steps=steps,
                 cfg=cfg,
-                shift=shift,
                 seed=seed,
                 scheduler=scheduler,
                 riflex_freq_index=riflex_freq_index,
@@ -3337,6 +3365,40 @@ class WanVideoBidirectionalSampler:
                 experimental_args=experimental_args,
                 sigmas=sigmas
             )[0]
+        else:
+            # For forward-only case, create a single frame latent to satisfy the decoder
+            reverse_samples = WanVideoSampler().process(
+                model=model,
+                text_embeds=text_embeds,
+                image_embeds=reverse_image_embeds,
+                shift=shift,
+                steps=steps,
+                cfg=cfg,
+                seed=seed,
+                scheduler=scheduler,
+                riflex_freq_index=riflex_freq_index,
+                force_offload=force_offload,
+                samples=samples,
+                denoise_strength=denoise_strength,
+                feta_args=feta_args,
+                context_options=context_options,
+                teacache_args=teacache_args,
+                flowedit_args=flowedit_args,
+                batched_cfg=batched_cfg,
+                slg_args=slg_args,
+                rope_function=rope_function,
+                loop_args=loop_args,
+                experimental_args=experimental_args,
+                sigmas=sigmas
+            )[0]
+            # Trim to single frame
+            reverse_samples["samples"] = reverse_samples["samples"][:1]
+
+        # Return appropriate frame counts based on edge cases
+        if forward_only:
+            reverse_frames = 0
+        elif reverse_only:
+            forward_frames = 0
 
         return (forward_samples, reverse_samples, forward_frames, reverse_frames)
 
@@ -3344,38 +3406,46 @@ class WanVideoBidirectionalSampler:
 class WanVideoBidirectionalCombiner:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {
-            "forward_images": ("IMAGE", {"tooltip": "Forward pass images"}),
-            "reverse_images": ("IMAGE", {"tooltip": "Reverse pass images"}),
-            "start_frame_index": ("INT", {"default": 49, "min": 0, "max": 300, "step": 1, 
-                "tooltip": "Original start frame index used in generation"}),
-            "forward_original_frames": ("INT", {"default": 49, "min": 1, "max": 300, "step": 1,
-                "tooltip": "Original number of frames in forward pass (before padding)"}),
-            "reverse_original_frames": ("INT", {"default": 49, "min": 1, "max": 300, "step": 1,
-                "tooltip": "Original number of frames in reverse pass (before padding)"}),
-        }}
+        return {
+            "required": {
+                "forward_images": ("IMAGE",),
+                "reverse_images": ("IMAGE",),
+                "forward_original_frames": ("INT", {"default": 49, "min": 1, "max": 300, "step": 1, "tooltip": "Original number of frames in forward pass (before padding)"}),
+                "reverse_original_frames": ("INT", {"default": 49, "min": 1, "max": 300, "step": 1, "tooltip": "Original number of frames in reverse pass (before padding)"}),
+                "forward_only": ("BOOLEAN", {"default": False, "tooltip": "Set to true if this is a forward-only pass"}),
+                "reverse_only": ("BOOLEAN", {"default": False, "tooltip": "Set to true if this is a reverse-only pass"}),
+            }
+        }
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("combined_images",)
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Combines and trims bidirectional video frames to the correct length"
+    DESCRIPTION = "Combines forward and reverse video frames, handling edge cases"
 
-    def process(self, forward_images, reverse_images, start_frame_index, forward_original_frames, reverse_original_frames):
+    def process(self, forward_images, reverse_images, forward_original_frames, reverse_original_frames, forward_only, reverse_only):
+        # Handle edge cases
+        if forward_only:
+            # Just return the forward frames trimmed to original length
+            return (forward_images[:forward_original_frames],)
+        elif reverse_only:
+            # Just return the reverse frames trimmed to original length
+            return (reverse_images[:reverse_original_frames],)
+
         # Take only the original frames from each sequence
         forward_frames = forward_images[:forward_original_frames]
         reverse_frames = reverse_images[:reverse_original_frames]
-        
-        # Reverse the reverse sequence back to original order
+
+        # Reverse the reverse sequence back to its original order
         reverse_frames = reverse_frames.flip(0)
-        
-        # Remove the overlapping frame (start_frame) from the forward sequence
+
+        # Remove the overlapping frame from the forward sequence
         forward_frames = forward_frames[1:]
-        
-        # Combine sequences: reverse first (beginning to start_frame), then forward (start_frame+1 to end)
-        combined = torch.cat([reverse_frames, forward_frames], dim=0)
-            
-        return (combined,)
+
+        # Combine the sequences
+        combined_frames = torch.cat([reverse_frames, forward_frames], dim=0)
+
+        return (combined_frames,)
 
 class WanVideoBidirectionalSplit:
     @classmethod
@@ -3386,47 +3456,58 @@ class WanVideoBidirectionalSplit:
                 "tooltip": "Index of the frame to split at"}),
         }}
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "INT", "INT", "INT", "INT")
-    RETURN_NAMES = ("forward_images", "reverse_images", "forward_padded_frames", "reverse_padded_frames", "forward_original_frames", "reverse_original_frames")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "INT", "INT", "INT", "INT", "BOOLEAN", "BOOLEAN")
+    RETURN_NAMES = ("forward_images", "reverse_images", "forward_padded_frames", "reverse_padded_frames", 
+                   "forward_original_frames", "reverse_original_frames", "forward_only", "reverse_only")
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Splits and pads image sequence for bidirectional processing"
 
     def process(self, images, start_frame_index):
+        # Handle edge cases
+        forward_only = start_frame_index == 0
+        reverse_only = start_frame_index == len(images) - 1
+        
         # Split images for forward and reverse passes
-        # Forward pass: start_frame to end (in original order)
-        forward_images = images[start_frame_index:]
-        # Reverse pass: start_frame to beginning (in reverse order)
-        reverse_images = images[:start_frame_index + 1].flip(0)
-        
+        if forward_only:
+            # Forward pass: all frames
+            forward_images = images
+            # Create dummy single frame for reverse pass
+            reverse_images = images[0:1]
+        elif reverse_only:
+            # Create dummy single frame for forward pass
+            forward_images = images[-1:]
+            # Reverse pass: all frames in reverse
+            reverse_images = images.flip(0)
+        else:
+            # Normal case: split at start_frame_index
+            forward_images = images[start_frame_index:]
+            reverse_images = images[:start_frame_index + 1].flip(0)
+
         # Calculate original frame counts
-        forward_original_frames = forward_images.shape[0]
-        reverse_original_frames = reverse_images.shape[0]
-        
-        # Pad frames to nearest 4n+1
+        forward_original_frames = len(forward_images)
+        reverse_original_frames = len(reverse_images)
+
+        # Pad to 4n+1
         def pad_to_4n1(frames):
-            remainder = (frames - 1) % 4
-            if remainder != 0:
-                return frames + (4 - remainder)
+            n = len(frames)
+            target = ((n + 3) // 4) * 4 + 1
+            if target > n:
+                # Repeat the last frame for padding
+                padding = frames[-1:].repeat(target - n, 1, 1, 1)
+                return torch.cat([frames, padding], dim=0)
             return frames
-            
-        # Calculate padded frame counts
-        forward_padded_frames = pad_to_4n1(forward_original_frames)
-        reverse_padded_frames = pad_to_4n1(reverse_original_frames)
-        
-        # Pad the images to match the padded frame counts
-        if forward_padded_frames > forward_original_frames:
-            # Pad forward sequence with repeated last frame
-            padding = forward_images[-1:].repeat(forward_padded_frames - forward_original_frames, 1, 1, 1)
-            forward_images = torch.cat([forward_images, padding], dim=0)
-            
-        if reverse_padded_frames > reverse_original_frames:
-            # Pad reverse sequence with repeated last frame
-            padding = reverse_images[-1:].repeat(reverse_padded_frames - reverse_original_frames, 1, 1, 1)
-            reverse_images = torch.cat([reverse_images, padding], dim=0)
-            
+
+        # Pad both sequences
+        forward_images = pad_to_4n1(forward_images)
+        reverse_images = pad_to_4n1(reverse_images)
+
+        # Get padded frame counts
+        forward_padded_frames = len(forward_images)
+        reverse_padded_frames = len(reverse_images)
+
         return (forward_images, reverse_images, forward_padded_frames, reverse_padded_frames, 
-                forward_original_frames, reverse_original_frames)
+                forward_original_frames, reverse_original_frames, forward_only, reverse_only)
 
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
