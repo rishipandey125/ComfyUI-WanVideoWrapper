@@ -3520,9 +3520,16 @@ class WanVideoChainedSampler:
     def INPUT_TYPES(s):
         return {
             "required": {
+                "vae": ("WANVAE",),
                 "model": ("WANVIDEOMODEL",),
                 "text_embeds": ("WANVIDEOTEXTEMBEDS", ),
-                "image_embeds": ("WANVIDIMAGE_EMBEDS", ),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
+                "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
+                "input_frames": ("IMAGE",),                
+                "input_frames_2": ("IMAGE",),
+                "input_masks": ("MASK",),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001}),
                 "steps": ("INT", {"default": 5, "min": 1}),
                 "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.01}),
                 "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
@@ -3536,54 +3543,51 @@ class WanVideoChainedSampler:
                 "overlap_frames": ("INT", {"default": 4, "min": 0, "max": 20, "step": 1}),
             }
         }
-
     RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("samples",)
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def get_chain_segments(self, total_frames):
-        segments = []
-        current_pos = 0
-        while current_pos < total_frames:
-            max_segment = min(81, total_frames - current_pos)
-            adjusted_length = ((max_segment + 3) // 4) * 4 + 1
-            if current_pos + adjusted_length > total_frames:
-                adjusted_length = total_frames - current_pos
-                if adjusted_length % 4 != 1:
-                    adjusted_length = ((adjusted_length + 3) // 4) * 4 + 1
-            segments.append((current_pos, min(current_pos + adjusted_length, total_frames)))
-            current_pos += adjusted_length - self.overlap_frames
-        return segments
+    def process(self, vae, model, text_embeds, width, height, num_frames, input_frames, input_frames_2, input_masks, strength, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
+        self.overlap_frames = overlap_frames
 
-    def extract_segment(self, image_embeds, start_frame, end_frame):
-        segment_embeds = image_embeds.copy()
-        for key in image_embeds:
-            if isinstance(image_embeds[key], torch.Tensor):
-                if len(image_embeds[key].shape) > 1:
-                    segment_embeds[key] = image_embeds[key][:, start_frame:end_frame]
-        segment_embeds["num_frames"] = end_frame - start_frame
-        return segment_embeds
+        #let's create the image embeds here! 
 
-    def stitch_segments(self, prev_segment, next_segment, overlap_frames):
-        if overlap_frames == 0:
-            return torch.cat([prev_segment, next_segment], dim=1)
-        weights = torch.linspace(1, 0, overlap_frames, device=prev_segment.device)
-        weights = weights.view(1, -1, 1, 1)
-        overlap_prev = prev_segment[:, -overlap_frames:] * weights
-        overlap_next = next_segment[:, :overlap_frames] * (1 - weights)
-        return torch.cat([
-            prev_segment[:, :-overlap_frames],
-            overlap_prev + overlap_next,
-            next_segment[:, overlap_frames:]
-        ], dim=1)
+        strength_v2v = strength
+        strength_i2v = 1.0 - strength
 
-    def process(self, model, text_embeds, image_embeds, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
-        # Directly call the original sampler
+        # First control (edge)
+        first_image_embeds = WanVideoVACEEncode().process(
+            vae=vae,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            strength=strength_v2v,
+            vace_start_percent=0.0,
+            vace_end_percent=1.0,
+            input_frames=input_frames,
+            input_masks=input_masks,
+        )[0]
+
+        # Second control (depth), chaining the first as prev_vace_embeds
+        second_image_embeds = WanVideoVACEEncode().process(
+            vae=vae,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            strength=strength_i2v,
+            vace_start_percent=0.0,
+            vace_end_percent=1.0,
+            input_frames=input_frames_2,
+            input_masks=input_masks,
+            prev_vace_embeds=first_image_embeds,
+        )[0]
+
+
         return WanVideoSampler().process(
             model=model,
             text_embeds=text_embeds,
-            image_embeds=image_embeds,
+            image_embeds=second_image_embeds,
             steps=steps,
             cfg=cfg,
             shift=shift,
@@ -3595,32 +3599,6 @@ class WanVideoChainedSampler:
             batched_cfg=batched_cfg,
             rope_function=rope_function
         )
-        # self.overlap_frames = overlap_frames
-        # total_frames = image_embeds["num_frames"]
-        # segments = self.get_chain_segments(total_frames)
-        # final_output = None
-        # for i, (start_frame, end_frame) in enumerate(segments):
-        #     segment_embeds = self.extract_segment(image_embeds, start_frame, end_frame)
-        #     segment_output = WanVideoSampler().process(
-        #         model=model,
-        #         text_embeds=text_embeds,
-        #         image_embeds=segment_embeds,
-        #         steps=steps,
-        #         cfg=cfg,
-        #         shift=shift,
-        #         seed=seed,
-        #         force_offload=force_offload,
-        #         scheduler=scheduler,
-        #         riflex_freq_index=riflex_freq_index,
-        #         denoise_strength=denoise_strength,
-        #         batched_cfg=batched_cfg,
-        #         rope_function=rope_function
-        #     )[0]["samples"]
-        #     if final_output is None:
-        #         final_output = segment_output
-        #     else:
-        #         final_output = self.stitch_segments(final_output, segment_output, overlap_frames)
-        # return {"samples": final_output}
 
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
