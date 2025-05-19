@@ -3515,6 +3515,113 @@ class WanVideoEncode:
  
         return ({"samples": latents, "mask": latent_mask},)
 
+class WanVideoChainedSampler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("WANVIDEOMODEL",),
+                "text_embeds": ("WANVIDEOTEXTEMBEDS", ),
+                "image_embeds": ("WANVIDIMAGE_EMBEDS", ),
+                "steps": ("INT", {"default": 5, "min": 1}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.01}),
+                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "force_offload": ("BOOLEAN", {"default": True}),
+                "scheduler": (["unipc", "unipc/beta", "dpm++", "dpm++/beta","dpm++_sde", "dpm++_sde/beta", "euler", "euler/beta", "deis", "lcm", "lcm/beta", "flowmatch_causvid"], {"default": 'unipc'}),
+                "riflex_freq_index": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1}),
+                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "batched_cfg": ("BOOLEAN", {"default": False}),
+                "rope_function": (["default", "comfy"], {"default": "comfy"}),
+                "overlap_frames": ("INT", {"default": 4, "min": 0, "max": 20, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("samples",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+
+    def get_chain_segments(self, total_frames):
+        segments = []
+        current_pos = 0
+        while current_pos < total_frames:
+            max_segment = min(81, total_frames - current_pos)
+            adjusted_length = ((max_segment + 3) // 4) * 4 + 1
+            if current_pos + adjusted_length > total_frames:
+                adjusted_length = total_frames - current_pos
+                if adjusted_length % 4 != 1:
+                    adjusted_length = ((adjusted_length + 3) // 4) * 4 + 1
+            segments.append((current_pos, min(current_pos + adjusted_length, total_frames)))
+            current_pos += adjusted_length - self.overlap_frames
+        return segments
+
+    def extract_segment(self, image_embeds, start_frame, end_frame):
+        segment_embeds = image_embeds.copy()
+        for key in image_embeds:
+            if isinstance(image_embeds[key], torch.Tensor):
+                if len(image_embeds[key].shape) > 1:
+                    segment_embeds[key] = image_embeds[key][:, start_frame:end_frame]
+        segment_embeds["num_frames"] = end_frame - start_frame
+        return segment_embeds
+
+    def stitch_segments(self, prev_segment, next_segment, overlap_frames):
+        if overlap_frames == 0:
+            return torch.cat([prev_segment, next_segment], dim=1)
+        weights = torch.linspace(1, 0, overlap_frames, device=prev_segment.device)
+        weights = weights.view(1, -1, 1, 1)
+        overlap_prev = prev_segment[:, -overlap_frames:] * weights
+        overlap_next = next_segment[:, :overlap_frames] * (1 - weights)
+        return torch.cat([
+            prev_segment[:, :-overlap_frames],
+            overlap_prev + overlap_next,
+            next_segment[:, overlap_frames:]
+        ], dim=1)
+
+    def process(self, model, text_embeds, image_embeds, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
+        # Directly call the original sampler
+        return WanVideoSampler().process(
+            model=model,
+            text_embeds=text_embeds,
+            image_embeds=image_embeds,
+            steps=steps,
+            cfg=cfg,
+            shift=shift,
+            seed=seed,
+            force_offload=force_offload,
+            scheduler=scheduler,
+            riflex_freq_index=riflex_freq_index,
+            denoise_strength=denoise_strength,
+            batched_cfg=batched_cfg,
+            rope_function=rope_function
+        )
+        # self.overlap_frames = overlap_frames
+        # total_frames = image_embeds["num_frames"]
+        # segments = self.get_chain_segments(total_frames)
+        # final_output = None
+        # for i, (start_frame, end_frame) in enumerate(segments):
+        #     segment_embeds = self.extract_segment(image_embeds, start_frame, end_frame)
+        #     segment_output = WanVideoSampler().process(
+        #         model=model,
+        #         text_embeds=text_embeds,
+        #         image_embeds=segment_embeds,
+        #         steps=steps,
+        #         cfg=cfg,
+        #         shift=shift,
+        #         seed=seed,
+        #         force_offload=force_offload,
+        #         scheduler=scheduler,
+        #         riflex_freq_index=riflex_freq_index,
+        #         denoise_strength=denoise_strength,
+        #         batched_cfg=batched_cfg,
+        #         rope_function=rope_function
+        #     )[0]["samples"]
+        #     if final_output is None:
+        #         final_output = segment_output
+        #     else:
+        #         final_output = self.stitch_segments(final_output, segment_output, overlap_frames)
+        # return {"samples": final_output}
+
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
     "WanVideoDecode": WanVideoDecode,
@@ -3549,7 +3656,8 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoVACEStartToEndFrame": WanVideoVACEStartToEndFrame,
     "WanVideoVACEModelSelect": WanVideoVACEModelSelect,
     "WanVideoPhantomEmbeds": WanVideoPhantomEmbeds,
-    "CreateCFGScheduleFloatList": CreateCFGScheduleFloatList
+    "CreateCFGScheduleFloatList": CreateCFGScheduleFloatList,
+    "WanVideoChainedSampler": WanVideoChainedSampler
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -3586,5 +3694,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoVACEStartToEndFrame": "WanVideo VACE Start To End Frame",
     "WanVideoVACEModelSelect": "WanVideo VACE Model Select",
     "WanVideoPhantomEmbeds": "WanVideo Phantom Embeds",
-    "CreateCFGScheduleFloatList": "WanVideo CFG Schedule Float List"
+    "CreateCFGScheduleFloatList": "WanVideo CFG Schedule Float List",
+    "WanVideoChainedSampler": "WanVideo Chained Sampler"
     }
