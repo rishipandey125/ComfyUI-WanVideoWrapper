@@ -3628,7 +3628,7 @@ class WanVideoChainedSampler:
         keyframe_index_list = [int(i) for i in keyframe_indices.split(",")]
         first_keyframe = min(keyframe_index_list)
 
-        def run_chunk(start, end, key_frames, control_frames):
+        def run_chunk(start, end, key_frames, control_frames, extra_keyframe=None):
             sub_keyframes = []
             sub_key_images = []
 
@@ -3636,6 +3636,18 @@ class WanVideoChainedSampler:
                 if start <= k <= end:
                     sub_keyframes.append(k - start)
                     sub_key_images.append(key_frames[i])
+
+            if extra_keyframe is not None:
+                ek_idx, ek_img = extra_keyframe
+                if start <= ek_idx <= end:
+                    sub_keyframes.append(ek_idx - start)
+                    sub_key_images.append(ek_img)
+            
+            print("RUN CHUNK")
+            print("Start: " + str(start))
+            print("End: " + str(end))
+            print("Keyframe Indices...")
+            print(sub_keyframes)
 
             sub_key_images = torch.stack(sub_key_images) if sub_key_images else torch.empty((0, height, width, 3), device=control_frames.device)
             chunk_control = control_frames[start:end+1]
@@ -3706,17 +3718,36 @@ class WanVideoChainedSampler:
 
             # Backward
             b_start = first_keyframe
+            prev_first_frame = None
+
             while b_start > 0: 
-                size = min(81, b_start + 1) 
-                chunk = run_chunk(max(0, b_start - size + 1), b_start, key_frames, control_frames)
+                size = min(81, b_start + 1)
+                chunk_start = max(0, b_start - size + 1)
+
+                extra_keyframe = (b_start, prev_first_frame) if prev_first_frame is not None else None
+                chunk = run_chunk(chunk_start, b_start, key_frames, control_frames, extra_keyframe=extra_keyframe)
+
+                # Save the first frame from this chunk to be reused in the next
+                prev_first_frame = chunk[0]
+
                 backward_chunks.insert(0, chunk)
                 b_start -= size - 1  # overlap is 1
+                #so in the backward pass you would want the first frame from the backward pass to be the last keyframe for the next iteration
 
             # Forward
             f_start = first_keyframe
+            prev_last_frame = None
+
             while f_start < num_frames - 1:
                 size = min(81, num_frames - f_start)
-                chunk = run_chunk(f_start, min(f_start + size - 1, num_frames - 1), key_frames, control_frames)
+                chunk_end = min(f_start + size - 1, num_frames - 1)
+
+                extra_keyframe = (f_start, prev_last_frame) if prev_last_frame is not None else None
+                chunk = run_chunk(f_start, chunk_end, key_frames, control_frames, extra_keyframe=extra_keyframe)
+
+                # Save the last frame to be reused in the next forward pass
+                prev_last_frame = chunk[-1]
+
                 forward_chunks.append(chunk)
                 f_start += size - 1  # overlap is 1
 
