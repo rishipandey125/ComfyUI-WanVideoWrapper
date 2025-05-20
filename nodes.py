@@ -3709,6 +3709,8 @@ class WanVideoChainedSampler:
 
             return trim_batch(decoded_images, original_count)
 
+        print("CREATING VIDEO")
+        print("Key Frames: " + str(key_frames))
         if num_frames <= 81:
             out = run_chunk(0, num_frames - 1, key_frames, control_frames)
         else:
