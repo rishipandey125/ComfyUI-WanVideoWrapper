@@ -3550,22 +3550,43 @@ class WanVideoChainedSampler:
     CATEGORY = "WanVideoWrapper"
 
     def process(self, vae, model, text_embeds, width, height, num_frames, control_frames, key_frames, keyframe_indices, strength, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
-        def create_frame_sequence(num_frames, keyframe_indices, keyframe_images, control_frames=None, inpaint_mask=None, empty_frame_level=0.5):
-            """
-            Creates a frame sequence with keyframes slotted in at specified indices.
+
+        def pad_batch(images):
+            # Get the current batch size
+            current_size = images.shape[0]
             
-            Args:
-                num_frames (int): Total number of frames in sequence
-                keyframe_indices (list): List of indices where keyframes should be placed
-                keyframe_images (torch.Tensor): Batch of keyframe images
-                control_frames (torch.Tensor, optional): Control frames sequence. If None, creates empty frames
-                empty_frame_level (float): Gray level for empty frames when no control frames provided
+            # Calculate the next 4n+1 size
+            n = math.ceil((current_size - 1) / 4)
+            target_size = 4 * n + 1
             
-            Returns:
-                tuple: (frame_sequence, masks)
-                    - frame_sequence: Tensor of shape (num_frames, H, W, 3)
-                    - masks: Tensor of shape (num_frames, H, W) where 0=keyframe, 1=control/empty
-            """
+            # If we're already at a 4n+1 size, return as is
+            if current_size == target_size:
+                return (images, current_size, target_size)
+                
+            # Calculate how many frames we need to pad
+            padding_size = target_size - current_size
+            
+            # Get the last frame to repeat
+            last_frame = images[-1]
+            
+            # Create the padding frames by repeating the last frame
+            padding_frames = last_frame.unsqueeze(0).repeat(padding_size, 1, 1, 1)
+            
+            # Concatenate the original frames with the padding frames
+            padded_images = torch.cat([images, padding_frames], dim=0)
+            
+            return padded_images, current_size, target_size
+        
+        def trim_batch(images, original_count):
+            # Ensure original_count is not larger than the current batch size
+            original_count = min(original_count, images.shape[0])
+            
+            # Trim the batch to the original size
+            trimmed_images = images[:original_count]
+            
+            return trimmed_images
+        
+        def create_frame_sequence(num_frames, keyframe_index_list, keyframe_images, control_frames=None, inpaint_mask=None, empty_frame_level=0.5):
             device = keyframe_images.device
             H, W = keyframe_images.shape[1:3]
 
@@ -3580,9 +3601,7 @@ class WanVideoChainedSampler:
             else: 
                 frames = control_frames[:num_frames]
 
-            index_list = [int(i) for i in keyframe_indices.split(",")]
-
-            for idx, slot_index in enumerate(index_list):
+            for idx, slot_index in enumerate(keyframe_index_list):
                 # Get the corresponding keyframe image from the batch
                 slot_image = keyframe_images[idx:idx+1]  # Keep batch dimension
                 # Replace the frame at slot_index with slot_image
@@ -3603,71 +3622,121 @@ class WanVideoChainedSampler:
 
             return frames.cpu().float(), masks.cpu().float()
         
-        self.overlap_frames = overlap_frames
-
-        #first i have to create the input_frames, input_masks, and input_frames_2
-
-        cn_frames, mask = create_frame_sequence(num_frames, keyframe_indices, key_frames, control_frames)
-
-        i2v_frames, i2v_mask  = create_frame_sequence(num_frames, keyframe_indices, key_frames)
 
         strength_v2v = strength
         strength_i2v = 1.0 - strength  
+        keyframe_index_list = [int(i) for i in keyframe_indices.split(",")]
+        first_keyframe = min(keyframe_index_list)
 
-        
-        cn_image_embeds = WanVideoVACEEncode().process(
-            vae=vae,
-            width=width,
-            height=height,
-            num_frames=num_frames,
-            strength=strength_v2v,
-            vace_start_percent=0.0,
-            vace_end_percent=1.0,
-            input_frames=cn_frames,
-            input_masks=mask,
-        )[0]
+        def run_chunk(start, end, key_frames, control_frames):
+            sub_keyframes = []
+            sub_key_images = []
 
-        i2v_image_embeds = WanVideoVACEEncode().process(
-            vae=vae,
-            width=width,
-            height=height,
-            num_frames=num_frames,
-            strength=strength_i2v,
-            vace_start_percent=0.0,
-            vace_end_percent=1.0,
-            input_frames=i2v_frames,
-            input_masks=mask,
-            prev_vace_embeds=cn_image_embeds,
-        )[0]
+            for i, k in enumerate(keyframe_index_list):
+                if start <= k <= end:
+                    sub_keyframes.append(k - start)
+                    sub_key_images.append(key_frames[i])
 
-        samples = WanVideoSampler().process(
-            model=model,
-            text_embeds=text_embeds,
-            image_embeds=i2v_image_embeds,
-            steps=steps,
-            cfg=cfg,
-            shift=shift,
-            seed=seed,
-            force_offload=force_offload,
-            scheduler=scheduler,
-            riflex_freq_index=riflex_freq_index,
-            denoise_strength=denoise_strength,
-            batched_cfg=batched_cfg,
-            rope_function=rope_function
-        )
+            sub_key_images = torch.stack(sub_key_images) if sub_key_images else torch.empty((0, height, width, 3), device=control_frames.device)
+            chunk_control = control_frames[start:end+1]
+            chunk_control, original_count, padded_count = pad_batch(chunk_control)
 
-        decoded_images = WanVideoDecode().decode(
-            vae=vae,
-            samples=samples[0],  # samples[0] because WanVideoSampler returns a tuple
-            enable_vae_tiling=False,  # default values from the class
-            tile_x=272,
-            tile_y=272,
-            tile_stride_x=144,
-            tile_stride_y=128
-        )
+            cn_frames, mask = create_frame_sequence(padded_count, sub_keyframes, sub_key_images, chunk_control)
+            i2v_frames, i2v_mask  = create_frame_sequence(padded_count, sub_keyframes, sub_key_images)
 
-        return (decoded_images[0],)
-        # return(cn_frames,i2v_frames,mask)
+            cn_image_embeds = WanVideoVACEEncode().process(
+                vae=vae,
+                width=width,
+                height=height,
+                num_frames=padded_count,
+                strength=strength_v2v,
+                vace_start_percent=0.0,
+                vace_end_percent=1.0,
+                input_frames=cn_frames,
+                input_masks=mask,
+            )[0]
+
+            i2v_image_embeds = WanVideoVACEEncode().process(
+                vae=vae,
+                width=width,
+                height=height,
+                num_frames=padded_count,
+                strength=strength_i2v,
+                vace_start_percent=0.0,
+                vace_end_percent=1.0,
+                input_frames=i2v_frames,
+                input_masks=mask,
+                prev_vace_embeds=cn_image_embeds,
+            )[0]
+
+            samples = WanVideoSampler().process(
+                model=model,
+                text_embeds=text_embeds,
+                image_embeds=i2v_image_embeds,
+                steps=steps,
+                cfg=cfg,
+                shift=shift,
+                seed=seed,
+                force_offload=force_offload,
+                scheduler=scheduler,
+                riflex_freq_index=riflex_freq_index,
+                denoise_strength=denoise_strength,
+                batched_cfg=batched_cfg,
+                rope_function=rope_function
+            )
+
+            decoded_images = WanVideoDecode().decode(
+                vae=vae,
+                samples=samples[0],
+                enable_vae_tiling=False,
+                tile_x=272,
+                tile_y=272,
+                tile_stride_x=144,
+                tile_stride_y=128
+            )[0]
+
+            return trim_batch(decoded_images, original_count)
+
+        if num_frames <= 81:
+            out = run_chunk(0, num_frames - 1, key_frames, control_frames)
+        else:
+            chunks = []
+            backward_chunks = []
+            forward_chunks = []
+
+            # Backward
+            b_start = first_keyframe
+            while b_start > 0: 
+                size = min(81, b_start + 1) 
+                chunk = run_chunk(max(0, b_start - size + 1), b_start, key_frames, control_frames)
+                backward_chunks.insert(0, chunk)
+                b_start -= size - 1  # overlap is 1
+
+            # Forward
+            f_start = first_keyframe
+            while f_start < num_frames - 1:
+                size = min(81, num_frames - f_start)
+                chunk = run_chunk(f_start, min(f_start + size - 1, num_frames - 1), key_frames, control_frames)
+                forward_chunks.append(chunk)
+                f_start += size - 1  # overlap is 1
+
+            # Trim overlaps
+            trimmed_chunks = []
+            for i, chunk in enumerate(backward_chunks):
+                if i < len(backward_chunks) - 1:
+                    trimmed_chunks.append(chunk[:-1])  # trim tail
+                else:
+                    trimmed_chunks.append(chunk)       # last backward chunk (ends at anchor)
+
+            for i, chunk in enumerate(forward_chunks):
+                if i == 0:
+                    trimmed_chunks.append(chunk)       # first forward chunk (starts at anchor)
+                else:
+                    trimmed_chunks.append(chunk[1:])   # trim head
+
+            out = torch.cat(trimmed_chunks, dim=0)
+
+        return (out,)
 
 
 NODE_CLASS_MAPPINGS = {
