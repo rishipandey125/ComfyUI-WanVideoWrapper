@@ -3526,9 +3526,9 @@ class WanVideoChainedSampler:
                 "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
                 "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
                 "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
-                "input_frames": ("IMAGE",),                
-                "input_frames_2": ("IMAGE",),
-                "input_masks": ("MASK",),
+                "control_frames": ("IMAGE",),
+                "key_frames": ("IMAGE",),                
+                "keyframe_indices": ("STRING", {"default": ""}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001}),
                 "steps": ("INT", {"default": 5, "min": 1}),
                 "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.01}),
@@ -3543,21 +3543,79 @@ class WanVideoChainedSampler:
                 "overlap_frames": ("INT", {"default": 4, "min": 0, "max": 20, "step": 1}),
             }
         }
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("samples",)
+    # RETURN_TYPES = ("LATENT",)
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, vae, model, text_embeds, width, height, num_frames, input_frames, input_frames_2, input_masks, strength, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
+    def process(self, vae, model, text_embeds, width, height, num_frames, control_frames, key_frames, keyframe_indices, strength, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
+        def create_frame_sequence(num_frames, keyframe_indices, keyframe_images, control_frames=None, inpaint_mask=None, empty_frame_level=0.5):
+            """
+            Creates a frame sequence with keyframes slotted in at specified indices.
+            
+            Args:
+                num_frames (int): Total number of frames in sequence
+                keyframe_indices (list): List of indices where keyframes should be placed
+                keyframe_images (torch.Tensor): Batch of keyframe images
+                control_frames (torch.Tensor, optional): Control frames sequence. If None, creates empty frames
+                empty_frame_level (float): Gray level for empty frames when no control frames provided
+            
+            Returns:
+                tuple: (frame_sequence, masks)
+                    - frame_sequence: Tensor of shape (num_frames, H, W, 3)
+                    - masks: Tensor of shape (num_frames, H, W) where 0=keyframe, 1=control/empty
+            """
+            device = keyframe_images.device
+            H, W = keyframe_images.shape[1:3]
+
+            masks = torch.ones((num_frames, H, W), device=device)
+
+            if control_frames is not None: 
+                control_frames = common_upscale(control_frames.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(1, -1)
+            
+            # Create empty frames 
+            if control_frames is None: 
+                frames = torch.ones((num_frames, H, W, 3), device=device) * empty_frame_level
+            else: 
+                frames = control_frames[:num_frames]
+
+            index_list = [int(i) for i in keyframe_indices.split(",")]
+
+            for idx, slot_index in enumerate(index_list):
+                # Get the corresponding keyframe image from the batch
+                slot_image = keyframe_images[idx:idx+1]  # Keep batch dimension
+                # Replace the frame at slot_index with slot_image
+                frames[slot_index:slot_index + slot_image.shape[0]] = slot_image
+                
+                # Create mask for the slot image
+                masks[slot_index:slot_index + slot_image.shape[0]] = 0
+
+                if inpaint_mask is not None:
+                    inpaint_mask = common_upscale(inpaint_mask.unsqueeze(1), W, H, "nearest-exact", "disabled").squeeze(1).to(device)
+                    if inpaint_mask.shape[0] > num_frames:
+                        inpaint_mask = inpaint_mask[:num_frames]
+                    elif inpaint_mask.shape[0] < num_frames:
+                        inpaint_mask = inpaint_mask.repeat(num_frames // inpaint_mask.shape[0] + 1, 1, 1)[:num_frames]
+
+                    empty_mask = torch.ones_like(masks, device=device)
+                    masks = inpaint_mask * empty_mask
+
+            return frames.cpu().float(), masks.cpu().float()
+        
         self.overlap_frames = overlap_frames
 
-        #let's create the image embeds here! 
+        #first i have to create the input_frames, input_masks, and input_frames_2
+
+        cn_frames, mask = create_frame_sequence(num_frames, keyframe_indices, key_frames, control_frames)
+
+        i2v_frames, i2v_mask  = create_frame_sequence(num_frames, keyframe_indices, key_frames)
 
         strength_v2v = strength
-        strength_i2v = 1.0 - strength
+        strength_i2v = 1.0 - strength  
 
-        # First control (edge)
-        first_image_embeds = WanVideoVACEEncode().process(
+        
+        cn_image_embeds = WanVideoVACEEncode().process(
             vae=vae,
             width=width,
             height=height,
@@ -3565,12 +3623,11 @@ class WanVideoChainedSampler:
             strength=strength_v2v,
             vace_start_percent=0.0,
             vace_end_percent=1.0,
-            input_frames=input_frames,
-            input_masks=input_masks,
+            input_frames=cn_frames,
+            input_masks=mask,
         )[0]
 
-        # Second control (depth), chaining the first as prev_vace_embeds
-        second_image_embeds = WanVideoVACEEncode().process(
+        i2v_image_embeds = WanVideoVACEEncode().process(
             vae=vae,
             width=width,
             height=height,
@@ -3578,16 +3635,15 @@ class WanVideoChainedSampler:
             strength=strength_i2v,
             vace_start_percent=0.0,
             vace_end_percent=1.0,
-            input_frames=input_frames_2,
-            input_masks=input_masks,
-            prev_vace_embeds=first_image_embeds,
+            input_frames=i2v_frames,
+            input_masks=mask,
+            prev_vace_embeds=cn_image_embeds,
         )[0]
 
-
-        return WanVideoSampler().process(
+        samples = WanVideoSampler().process(
             model=model,
             text_embeds=text_embeds,
-            image_embeds=second_image_embeds,
+            image_embeds=i2v_image_embeds,
             steps=steps,
             cfg=cfg,
             shift=shift,
@@ -3599,6 +3655,20 @@ class WanVideoChainedSampler:
             batched_cfg=batched_cfg,
             rope_function=rope_function
         )
+
+        decoded_images = WanVideoDecode().decode(
+            vae=vae,
+            samples=samples[0],  # samples[0] because WanVideoSampler returns a tuple
+            enable_vae_tiling=False,  # default values from the class
+            tile_x=272,
+            tile_y=272,
+            tile_stride_x=144,
+            tile_stride_y=128
+        )
+
+        return (decoded_images[0],)
+        # return(cn_frames,i2v_frames,mask)
+
 
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
