@@ -3725,26 +3725,7 @@ class WanVideoChainedSampler:
             out = run_chunk(0, num_frames - 1, key_frames, control_frames)
         else:
             chunks = []
-            backward_chunks = []
             forward_chunks = []
-
-            # Backward
-            b_start = first_keyframe
-            prev_first_frame = None
-
-            while b_start > 0: 
-                size = min(81, b_start + 1)
-                chunk_start = max(0, b_start - size + 1)
-
-                extra_keyframe = (b_start, prev_first_frame) if prev_first_frame is not None else None
-                chunk = run_chunk(chunk_start, b_start, key_frames, control_frames, extra_keyframe=extra_keyframe)
-
-                # Save the first frame from this chunk to be reused in the next
-                prev_first_frame = chunk[0]
-
-                backward_chunks.insert(0, chunk)
-                b_start -= size - 1  # overlap is 1
-                #so in the backward pass you would want the first frame from the backward pass to be the last keyframe for the next iteration
 
             # so we no longer even need the backward chunks theoretically - we just need the forward chunks
             # Forward
@@ -3766,12 +3747,7 @@ class WanVideoChainedSampler:
 
             # Trim overlaps
             trimmed_chunks = []
-            for i, chunk in enumerate(backward_chunks):
-                if i < len(backward_chunks) - 1:
-                    trimmed_chunks.append(chunk[:-1])  # trim tail
-                else:
-                    trimmed_chunks.append(chunk)       # last backward chunk (ends at anchor)
-
+    
             for i, chunk in enumerate(forward_chunks):
                 if i == 0:
                     trimmed_chunks.append(chunk)       # first forward chunk (starts at anchor)
