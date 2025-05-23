@@ -3526,6 +3526,7 @@ class WanVideoChainedSampler:
                 "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
                 "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
                 "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
+                "reverse_processing": ("BOOLEAN", {"default": False, "tooltip": "Reverse the processing order of the video"}),
                 "control_frames": ("IMAGE",),
                 "key_frames": ("IMAGE",),           
                 "keyframe_indices": ("STRING", {"default": ""}),
@@ -3630,6 +3631,11 @@ class WanVideoChainedSampler:
         percentage = vace_percentage
 
         keyframe_index_list = [int(i) for i in keyframe_indices.split(",")]
+
+        if reverse_processing:
+            control_frames = torch.flip(control_frames, dims=[0])
+            keyframe_index_list = [num_frames - 1 - i for i in keyframe_index_list]
+            
         first_keyframe = min(keyframe_index_list)
 
         def run_chunk(start, end, key_frames, control_frames, extra_keyframe=None):
