@@ -3552,7 +3552,7 @@ class WanVideoChainedSampler:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, vae, model, text_embeds, width, height, num_frames, control_frames, key_frames, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
+    def process(self, vae, model, text_embeds, width, height, num_frames, reverse_processing, control_frames, key_frames, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
 
         def pad_batch(images):
             # Get the current batch size
@@ -3746,6 +3746,7 @@ class WanVideoChainedSampler:
                 b_start -= size - 1  # overlap is 1
                 #so in the backward pass you would want the first frame from the backward pass to be the last keyframe for the next iteration
 
+            # so we no longer even need the backward chunks theoretically - we just need the forward chunks
             # Forward
             f_start = first_keyframe
             prev_last_frame = None
