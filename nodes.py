@@ -3527,8 +3527,7 @@ class WanVideoChainedSampler:
                 "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
                 "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
                 "control_frames": ("IMAGE",),
-                "key_frames": ("IMAGE",),  
-                "reference_image": ("IMAGE",),              
+                "key_frames": ("IMAGE",),           
                 "keyframe_indices": ("STRING", {"default": ""}),
                 "cn_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
                 "i2v_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
@@ -3552,7 +3551,7 @@ class WanVideoChainedSampler:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, vae, model, text_embeds, width, height, num_frames, control_frames, key_frames, reference_image, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
+    def process(self, vae, model, text_embeds, width, height, num_frames, control_frames, key_frames, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
 
         def pad_batch(images):
             # Get the current batch size
@@ -3633,7 +3632,7 @@ class WanVideoChainedSampler:
         keyframe_index_list = [int(i) for i in keyframe_indices.split(",")]
         first_keyframe = min(keyframe_index_list)
 
-        def run_chunk(start, end, key_frames, control_frames, extra_keyframe=None, reference_image=None):
+        def run_chunk(start, end, key_frames, control_frames, extra_keyframe=None):
             sub_keyframes = []
             sub_key_images = []
 
@@ -3670,7 +3669,6 @@ class WanVideoChainedSampler:
                 vace_start_percent=0.0,
                 vace_end_percent=percentage,
                 input_frames=cn_frames,
-                ref_images=reference_image,
                 input_masks=mask,
             )[0]
 
@@ -3683,7 +3681,6 @@ class WanVideoChainedSampler:
                 vace_start_percent=0.0,
                 vace_end_percent=percentage,
                 input_frames=i2v_frames,
-                ref_images=reference_image,
                 input_masks=mask,
                 prev_vace_embeds=cn_image_embeds,
             )[0]
@@ -3734,7 +3731,7 @@ class WanVideoChainedSampler:
                 chunk_start = max(0, b_start - size + 1)
 
                 extra_keyframe = (b_start, prev_first_frame) if prev_first_frame is not None else None
-                chunk = run_chunk(chunk_start, b_start, key_frames, control_frames, extra_keyframe=extra_keyframe, reference_image=reference_image)
+                chunk = run_chunk(chunk_start, b_start, key_frames, control_frames, extra_keyframe=extra_keyframe)
 
                 # Save the first frame from this chunk to be reused in the next
                 prev_first_frame = chunk[0]
@@ -3752,7 +3749,7 @@ class WanVideoChainedSampler:
                 chunk_end = min(f_start + size - 1, num_frames - 1)
 
                 extra_keyframe = (f_start, prev_last_frame) if prev_last_frame is not None else None
-                chunk = run_chunk(f_start, chunk_end, key_frames, control_frames, extra_keyframe=extra_keyframe, reference_image=reference_image)
+                chunk = run_chunk(f_start, chunk_end, key_frames, control_frames, extra_keyframe=extra_keyframe)
 
                 # Save the last frame to be reused in the next forward pass
                 prev_last_frame = chunk[-1]
