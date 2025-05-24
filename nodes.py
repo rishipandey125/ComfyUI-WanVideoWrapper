@@ -3532,8 +3532,10 @@ class WanVideoChainedSampler:
                 "text_embeds": ("WANVIDEOTEXTEMBEDS", ),
                 "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
                 "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
-                "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
+                "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 1, "tooltip": "Number of frames to encode"}),
+                "max_frames_per_chunk": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 1, "tooltip": "Number of frames per chunk"}),
                 "reverse_processing": ("BOOLEAN", {"default": False, "tooltip": "Reverse the processing order of the video"}),
+                "perfect_loop": ("BOOLEAN", {"default": False, "tooltip": "makes the video loop perfectly"}),
                 "control_frames": ("IMAGE",),
                 "key_frames": ("IMAGE",),           
                 "keyframe_indices": ("STRING", {"default": ""}),
@@ -3559,7 +3561,7 @@ class WanVideoChainedSampler:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, vae, model, text_embeds, width, height, num_frames, reverse_processing, control_frames, key_frames, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
+    def process(self, vae, model, text_embeds, width, height, num_frames, max_frames_per_chunk, reverse_processing, perfect_loop, control_frames, key_frames, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
 
         def pad_batch(images):
             # Get the current batch size
@@ -3642,10 +3644,21 @@ class WanVideoChainedSampler:
         if reverse_processing:
             control_frames = torch.flip(control_frames, dims=[0])
             keyframe_index_list = [num_frames - 1 - i for i in keyframe_index_list]
-            
+
+
+        if perfect_loop:
+            keyframe_index_list.append(num_frames)  
+            num_frames += 1 
+            key_frames = torch.cat([key_frames, key_frames[0].unsqueeze(0)], dim=0)  # Add the image
+            control_frames = torch.cat([control_frames, control_frames[0].unsqueeze(0)], dim=0)
+
+        #here i want to add some code in that makes this a perfect loop    
+        # i think the best way to do this is to take the first keyframe and add it to the keyframe system w/ it being "num_frames" and then also concat 1 more control to the end 
+
+
         first_keyframe = min(keyframe_index_list)
 
-        def run_chunk(start, end, key_frames, control_frames, extra_keyframe=None):
+        def run_chunk(start, end, key_frames, control_frames, overlap_images=None):
             sub_keyframes = []
             sub_key_images = []
 
@@ -3654,19 +3667,20 @@ class WanVideoChainedSampler:
                     sub_keyframes.append(k - start)
                     sub_key_images.append(key_frames[i])
 
-            if extra_keyframe is not None:
-                ek_idx, ek_img = extra_keyframe
-                if start <= ek_idx <= end:
-                    sub_keyframes.append(ek_idx - start)
-                    sub_key_images.append(ek_img)
-            
+            sub_key_images = torch.stack(sub_key_images) if sub_key_images else torch.empty((0, height, width, 3), device=control_frames.device)
+
+            if overlap_images is not None:
+                sub_key_images = torch.cat([overlap_images, sub_key_images], dim=0)
+                # Add corresponding indices for overlap images
+                overlap_indices = list(range(overlap_images.shape[0]))
+                sub_keyframes = overlap_indices + sub_keyframes
+
             print("RUN CHUNK")
             print("Start: " + str(start))
             print("End: " + str(end))
             print("Keyframe Indices...")
             print(sub_keyframes)
 
-            sub_key_images = torch.stack(sub_key_images) if sub_key_images else torch.empty((0, height, width, 3), device=control_frames.device)
             chunk_control = control_frames[start:end+1]
             chunk_control, original_count, padded_count = pad_batch(chunk_control)
 
@@ -3727,41 +3741,47 @@ class WanVideoChainedSampler:
             return trim_batch(decoded_images, original_count)
 
         print("CREATING VIDEO")
-        print("Key Frames: " + str(keyframe_indices))
-        if num_frames <= 81:
+        print("Keyframe Indices...")
+        print(keyframe_index_list)
+
+        if num_frames <= max_frames_per_chunk:
             out = run_chunk(0, num_frames - 1, key_frames, control_frames)
         else:
             chunks = []
-            forward_chunks = []
+            
+            chunk_start = first_keyframe #this should always be 0 theh way I have things setup 
+            overlap_images = None
+            first_run = True
 
-            # so we no longer even need the backward chunks theoretically - we just need the forward chunks
-            # Forward
-            f_start = first_keyframe
-            prev_last_frame = None
+            while chunk_start < num_frames - 1: #this makes sense since we are checking if the index we should render from is valid in the range 
+                size = min(max_frames_per_chunk, num_frames - chunk_start) #this is basically determining if we are on last chunk or not 
+                chunk_end = min(chunk_start + size - 1, num_frames - 1) #this is basically determing end of the curr chunk 
 
-            while f_start < num_frames - 1:
-                size = min(81, num_frames - f_start)
-                chunk_end = min(f_start + size - 1, num_frames - 1)
-
-                extra_keyframe = (f_start, prev_last_frame) if prev_last_frame is not None else None
-                chunk = run_chunk(f_start, chunk_end, key_frames, control_frames, extra_keyframe=extra_keyframe)
+                chunk = run_chunk(chunk_start, chunk_end, key_frames, control_frames, overlap_images=overlap_images)
 
                 # Save the last frame to be reused in the next forward pass
-                prev_last_frame = chunk[-1]
+                overlap_images = chunk[size-overlap_frames:] #TODO cache the overlap frames 
 
-                forward_chunks.append(chunk)
-                f_start += size - 1  # overlap is 1
+                chunks.append(chunk)
+
+                chunk_start += size - overlap_frames  # LGTM
+                if chunk_end == num_frames - 1:
+                    break #that was the last chunk! 
 
             # Trim overlaps
             trimmed_chunks = []
     
-            for i, chunk in enumerate(forward_chunks):
+            for i, chunk in enumerate(chunks):
                 if i == 0:
                     trimmed_chunks.append(chunk)       # first forward chunk (starts at anchor)
                 else:
-                    trimmed_chunks.append(chunk[1:])   # trim head
+                    trimmed_chunks.append(chunk[overlap_frames:])   # trim overlap frames
+
 
             out = torch.cat(trimmed_chunks, dim=0)
+
+        if perfect_loop:
+            out = out[:-1]  # Remove the last frame
 
         return (out,)
 
