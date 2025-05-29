@@ -3571,6 +3571,7 @@ class WanVideoChainedSampler:
                 "perfect_loop": ("BOOLEAN", {"default": False, "tooltip": "makes the video loop perfectly"}),
                 "control_frames": ("IMAGE",),
                 "key_frames": ("IMAGE",),           
+                "reference_image": ("IMAGE",),
                 "keyframe_indices": ("STRING", {"default": ""}),
                 "cn_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
                 "i2v_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
@@ -3586,10 +3587,8 @@ class WanVideoChainedSampler:
                 "batched_cfg": ("BOOLEAN", {"default": False}),
                 "rope_function": (["default", "comfy"], {"default": "comfy"}),
                 "overlap_frames": ("INT", {"default": 4, "min": 0, "max": 20, "step": 1}),
+                "model_reference": ("BOOLEAN", {"default": False}),
             },
-            "optional": {
-                "reference_image": ("IMAGE",),
-            }
         }
     # RETURN_TYPES = ("LATENT",)
     RETURN_TYPES = ("IMAGE",)
@@ -3597,7 +3596,7 @@ class WanVideoChainedSampler:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, vae, model, text_embeds, width, height, num_frames, max_frames_per_chunk, reverse_processing, perfect_loop, control_frames, key_frames, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames, reference_image=None):
+    def process(self, vae, model, text_embeds, width, height, num_frames, max_frames_per_chunk, reverse_processing, perfect_loop, control_frames, key_frames, reference_image, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames, model_reference):
 
         # need this color match func to work 
         def colormatch(image_ref, image_target, strength=1.0):
@@ -3756,14 +3755,15 @@ class WanVideoChainedSampler:
             print(sub_keyframes)
 
             chunk_control = control_frames[start:end+1]
-            # chunk_control, original_count, padded_count = pad_batch(chunk_control)
+            chunk_control, original_count, padded_count = pad_batch(chunk_control)
 
-            # print("Original Count: " + str(original_count))
-            print("Chunk Count: " + str(chunk_control.shape[0]))
+            print("Original Count: " + str(original_count))
+
+            print("Chunk Count: " + str(padded_count))
 
             cn_frames, mask = create_frame_sequence(padded_count, sub_keyframes, sub_key_images, chunk_control)
             i2v_frames, i2v_mask  = create_frame_sequence(padded_count, sub_keyframes, sub_key_images)
-            
+
             cn_image_embeds = WanVideoVACEEncode().process(
                 vae=vae,
                 width=width,
@@ -3774,7 +3774,7 @@ class WanVideoChainedSampler:
                 vace_end_percent=percentage,
                 input_frames=cn_frames,
                 input_masks=mask,
-                ref_images=reference_image,
+                ref_images=None if not model_reference else reference_image,
             )[0]
 
             i2v_image_embeds = WanVideoVACEEncode().process(
@@ -3788,7 +3788,7 @@ class WanVideoChainedSampler:
                 input_frames=i2v_frames,
                 input_masks=mask,
                 prev_vace_embeds=cn_image_embeds,
-                ref_images=reference_image,
+                ref_images=None if not model_reference else reference_image,
             )[0]
 
             samples = WanVideoSampler().process(
@@ -3818,9 +3818,9 @@ class WanVideoChainedSampler:
             )[0]
 
             frame_count = decoded_images.shape[0]
-            reference_repeat = reference_image.repeat((frame_count, 1,1,1))
+            reference_repeat = reference_image.repeat((original_count, 1,1,1))
 
-            # decoded_images = trim_batch(decoded_images, original_count)
+            decoded_images = trim_batch(decoded_images, original_count)
 
             decoded_images = colormatch(reference_repeat, decoded_images) #before you return the trim you should color correct it based on the reference image 
 
@@ -3869,8 +3869,11 @@ class WanVideoChainedSampler:
         if perfect_loop:
             out = out[:-1]  # Remove the last frame
         
-        reference_repeat = reference_image.repeat((num_frames, 1,1,1)) 
-        out = colormatch(reference_repeat, out) #do one more color match
+        if reverse_processing:
+            out = torch.flip(out, dims=[0])
+
+        # reference_repeat = reference_image.repeat((num_frames, 1,1,1)) 
+        # out = colormatch(reference_repeat, out) #do one more color match #is this the problem? 
         
         return (out,)
 
