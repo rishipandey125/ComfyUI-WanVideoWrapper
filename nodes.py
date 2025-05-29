@@ -3756,9 +3756,9 @@ class WanVideoChainedSampler:
             print(sub_keyframes)
 
             chunk_control = control_frames[start:end+1]
-            chunk_control, original_count, padded_count = pad_batch(chunk_control)
+            # chunk_control, original_count, padded_count = pad_batch(chunk_control)
 
-            print("Original Count: " + str(original_count))
+            # print("Original Count: " + str(original_count))
             print("Chunk Count: " + str(chunk_control.shape[0]))
 
             cn_frames, mask = create_frame_sequence(padded_count, sub_keyframes, sub_key_images, chunk_control)
@@ -3817,9 +3817,10 @@ class WanVideoChainedSampler:
                 tile_stride_y=128
             )[0]
 
-            reference_repeat = reference_image.repeat((original_count, 1,1,1))
+            frame_count = decoded_images.shape[0]
+            reference_repeat = reference_image.repeat((frame_count, 1,1,1))
 
-            decoded_images = trim_batch(decoded_images, original_count)
+            # decoded_images = trim_batch(decoded_images, original_count)
 
             decoded_images = colormatch(reference_repeat, decoded_images) #before you return the trim you should color correct it based on the reference image 
 
