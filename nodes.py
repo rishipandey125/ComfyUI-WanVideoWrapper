@@ -3586,6 +3586,9 @@ class WanVideoChainedSampler:
                 "batched_cfg": ("BOOLEAN", {"default": False}),
                 "rope_function": (["default", "comfy"], {"default": "comfy"}),
                 "overlap_frames": ("INT", {"default": 4, "min": 0, "max": 20, "step": 1}),
+            },
+            "optional": {
+                "reference_image": ("IMAGE",),
             }
         }
     # RETURN_TYPES = ("LATENT",)
@@ -3594,8 +3597,46 @@ class WanVideoChainedSampler:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, vae, model, text_embeds, width, height, num_frames, max_frames_per_chunk, reverse_processing, perfect_loop, control_frames, key_frames, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames):
+    def process(self, vae, model, text_embeds, width, height, num_frames, max_frames_per_chunk, reverse_processing, perfect_loop, control_frames, key_frames, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames, reference_image=None):
 
+        # need this color match func to work 
+        def colormatch(image_ref, image_target, strength=1.0):
+            method = 'mkl' # i set this to mkl because it's the best method i think  
+
+            try:
+                from color_matcher import ColorMatcher
+            except:
+                raise Exception("Can't import color-matcher, did you install requirements.txt? Manual install: pip install color-matcher")
+            cm = ColorMatcher()
+            image_ref = image_ref.cpu()
+            image_target = image_target.cpu()
+            batch_size = image_target.size(0)
+            out = []
+            images_target = image_target.squeeze()
+            images_ref = image_ref.squeeze()
+
+            image_ref_np = images_ref.numpy()
+            images_target_np = images_target.numpy()
+
+            if image_ref.size(0) > 1 and image_ref.size(0) != batch_size:
+                raise ValueError("ColorMatch: Use either single reference image or a matching batch of reference images.")
+
+            for i in range(batch_size):
+                image_target_np = images_target_np if batch_size == 1 else images_target[i].numpy()
+                image_ref_np_i = image_ref_np if image_ref.size(0) == 1 else images_ref[i].numpy()
+                try:
+                    image_result = cm.transfer(src=image_target_np, ref=image_ref_np_i, method=method)
+                except BaseException as e:
+                    print(f"Error occurred during transfer: {e}")
+                    break
+                # Apply the strength multiplier
+                image_result = image_target_np + strength * (image_result - image_target_np)
+                out.append(torch.from_numpy(image_result))
+                
+            out = torch.stack(out, dim=0).to(torch.float32)
+            out.clamp_(0, 1)
+            return out
+    
         def pad_batch(images):
             # Get the current batch size
             current_size = images.shape[0]
@@ -3717,6 +3758,9 @@ class WanVideoChainedSampler:
             chunk_control = control_frames[start:end+1]
             chunk_control, original_count, padded_count = pad_batch(chunk_control)
 
+            print("Original Count: " + str(original_count))
+            print("Chunk Count: " + str(chunk_control.shape[0]))
+
             cn_frames, mask = create_frame_sequence(padded_count, sub_keyframes, sub_key_images, chunk_control)
             i2v_frames, i2v_mask  = create_frame_sequence(padded_count, sub_keyframes, sub_key_images)
             
@@ -3730,6 +3774,7 @@ class WanVideoChainedSampler:
                 vace_end_percent=percentage,
                 input_frames=cn_frames,
                 input_masks=mask,
+                ref_images=reference_image,
             )[0]
 
             i2v_image_embeds = WanVideoVACEEncode().process(
@@ -3743,6 +3788,7 @@ class WanVideoChainedSampler:
                 input_frames=i2v_frames,
                 input_masks=mask,
                 prev_vace_embeds=cn_image_embeds,
+                ref_images=reference_image,
             )[0]
 
             samples = WanVideoSampler().process(
@@ -3771,7 +3817,13 @@ class WanVideoChainedSampler:
                 tile_stride_y=128
             )[0]
 
-            return trim_batch(decoded_images, original_count)
+            reference_repeat = reference_image.repeat((original_count, 1,1,1))
+
+            decoded_images = trim_batch(decoded_images, original_count)
+
+            decoded_images = colormatch(reference_repeat, decoded_images) #before you return the trim you should color correct it based on the reference image 
+
+            return decoded_images
 
         print("CREATING VIDEO")
         print("Keyframe Indices...")
@@ -3815,7 +3867,10 @@ class WanVideoChainedSampler:
 
         if perfect_loop:
             out = out[:-1]  # Remove the last frame
-
+        
+        reference_repeat = reference_image.repeat((num_frames, 1,1,1)) 
+        out = colormatch(reference_repeat, out) #do one more color match
+        
         return (out,)
 
 
