@@ -3589,6 +3589,17 @@ class WanVideoChainedSampler:
                 "overlap_frames": ("INT", {"default": 4, "min": 0, "max": 20, "step": 1}),
                 "model_reference": ("BOOLEAN", {"default": False}),
                 "color_match": ("BOOLEAN", {"default": True}),
+                "color_match_method": (
+                    [   
+                        'mkl',
+                        'hm', 
+                        'reinhard', 
+                        'mvgd', 
+                        'hm-mvgd-hm', 
+                        'hm-mkl-hm',
+                    ], {
+                    "default": 'mkl'
+                    }),
             },
         }
     # RETURN_TYPES = ("LATENT",)
@@ -3597,11 +3608,11 @@ class WanVideoChainedSampler:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, vae, model, text_embeds, width, height, num_frames, max_frames_per_chunk, reverse_processing, perfect_loop, control_frames, key_frames, reference_image, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames, model_reference, color_match):
+    def process(self, vae, model, text_embeds, width, height, num_frames, max_frames_per_chunk, reverse_processing, perfect_loop, control_frames, key_frames, reference_image, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames, model_reference, color_match, color_match_method):
 
         # need this color match func to work 
         def colormatch(image_ref, image_target, strength=1.0):
-            method = 'mkl' # i set this to mkl because it's the best method i think  
+            method = color_match_method
 
             try:
                 from color_matcher import ColorMatcher
