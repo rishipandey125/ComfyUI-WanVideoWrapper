@@ -3698,7 +3698,10 @@ class WanVideoChainedSampler:
             else: 
                 frames = control_frames[:num_frames]
 
+            slot_indices = [] 
             for idx, slot_index in enumerate(keyframe_index_list):
+                
+                slot_indices.append(slot_index)
                 # Get the corresponding keyframe image from the batch
                 slot_image = keyframe_images[idx:idx+1]  # Keep batch dimension
                 # Replace the frame at slot_index with slot_image
@@ -3743,7 +3746,7 @@ class WanVideoChainedSampler:
 
         first_keyframe = min(keyframe_index_list)
 
-        def run_chunk(start, end, key_frames, control_frames, overlap_images=None):
+        def run_chunk(start, end, key_frames, control_frames, forward=True, overlap_images=None):
             sub_keyframes = []
             sub_key_images = []
 
@@ -3755,10 +3758,19 @@ class WanVideoChainedSampler:
             sub_key_images = torch.stack(sub_key_images) if sub_key_images else torch.empty((0, height, width, 3), device=control_frames.device)
 
             if overlap_images is not None:
-                sub_key_images = torch.cat([overlap_images, sub_key_images], dim=0)
+                #there may be collisions in the keyframes here - i wonder how much that matters? 
+
+                # here we may need to end the batch in the overlap images instead of starting it if it is backwards 
+                if not forward: 
+                    sub_key_images = torch.cat([sub_key_images, overlap_images], dim=0)
+                    overlap_indices = list(range(sub_key_images.shape[0] - overlap_images.shape[0], sub_key_images.shape[0]))
+                    sub_keyframes = sub_keyframes + overlap_indices
+                else:
+                    sub_key_images = torch.cat([overlap_images, sub_key_images], dim=0)
                 # Add corresponding indices for overlap images
-                overlap_indices = list(range(overlap_images.shape[0]))
-                sub_keyframes = overlap_indices + sub_keyframes
+                    overlap_indices = list(range(overlap_images.shape[0]))
+                    sub_keyframes = overlap_indices + sub_keyframes
+
 
             print("RUN CHUNK")
             print("Start: " + str(start))
@@ -3848,42 +3860,81 @@ class WanVideoChainedSampler:
         else:
             chunks = []
             
-            chunk_start = first_keyframe #this should always be 0 theh way I have things setup 
-            overlap_images = None
+            #backward chunks 
+            backward_chunks = []    
+            b_start = first_keyframe #this is where you should split b/w forward and backward chunks 
+
+            backward_overlap_images = None
+            while b_start > 0: # once b_start is 0 you are on the last chunk 
+                size = min(max_frames_per_chunk, b_start + 1)
+                start = max(0, b_start - size + 1)
+                end = b_start
+
+                chunk = run_chunk(start, end, key_frames, control_frames, forward=False, overlap_images=backward_overlap_images)
+                backward_overlap_images = chunk[:overlap_frames] #TODO cache the overlap frames 
+
+                backward_chunks.insert(0, chunk)
+                b_start -= size - 1 
+
+            #forward chunks 
+            forward_chunks = []
+            f_start = first_keyframe
+
+            forward_overlap_images = None 
+
+            forward_overlap_frames = 0
+            if (f_start > 0):
+                # in this case you want to build up to f_start from the overlap 
+                # however in this case it may not mean that there are "overlap_frames" to work with it could be less 
+                # so you want to check if the backward chunks are actually enough to work with
+                forward_overlap_frames = min(backward_chunks[-1].shape[0], overlap_frames)
+
+                f_start = f_start - forward_overlap_frames + 1 #i think... 
+ 
+                forward_overlap_images = backward_chunks[-1][-forward_overlap_frames:] #set the forward overlap images to the last backward chunk 
+
             first_run = True
 
-            while chunk_start < num_frames - 1: #this makes sense since we are checking if the index we should render from is valid in the range 
-                size = min(max_frames_per_chunk, num_frames - chunk_start) #this is basically determining if we are on last chunk or not 
-                chunk_end = min(chunk_start + size - 1, num_frames - 1) #this is basically determing end of the curr chunk 
+            while f_start < num_frames - 1: #this makes sense since we are checking if the index we should render from is valid in the range 
+                size = min(max_frames_per_chunk, num_frames - f_start) #this is basically determining if we are on last chunk or not 
 
-                chunk = run_chunk(chunk_start, chunk_end, key_frames, control_frames, overlap_images=overlap_images)
+                start = f_start
+                end = min(f_start + size - 1, num_frames - 1) #this is basically determing end of the curr chunk 
+
+                chunk = run_chunk(start, end, key_frames, control_frames, forward=True, overlap_images=forward_overlap_images)
 
                 # Save the last frame to be reused in the next forward pass
                 overlap_images = chunk[size-overlap_frames:] #TODO cache the overlap frames 
 
-                chunks.append(chunk)
+                forward_chunks.append(chunk)
 
-                chunk_start += size - overlap_frames  # LGTM
-                if chunk_end == num_frames - 1:
-                    break #that was the last chunk! 
+                f_start += size - overlap_frames  # LGTM
+
+                if size < max_frames_per_chunk:
+                    break
 
             # Trim overlaps
             trimmed_chunks = []
-    
-            for i, chunk in enumerate(chunks):
-                if i == 0:
-                    trimmed_chunks.append(chunk)       # first forward chunk (starts at anchor)
+            for i, chunk in enumerate(backward_chunks):
+                if i < len(backward_chunks) - 1:
+                    trimmed_chunks.append(chunk[:-overlap_frames])  # trim tail
                 else:
-                    trimmed_chunks.append(chunk[overlap_frames:])   # trim overlap frames
+                    trimmed_chunks.append(chunk)       # last backward chunk (ends at anchor)
 
+            for i, chunk in enumerate(forward_chunks):
+                if i == 0:
+                    trimmed_chunks.append(chunk[forward_overlap_frames:])       # first forward chunk (starts at anchor)
+                else:
+                    trimmed_chunks.append(chunk[overlap_frames:])   # trim head
 
             out = torch.cat(trimmed_chunks, dim=0)
+
 
         if perfect_loop:
             out = out[:-1]  # Remove the last frame
         
-        if reverse_processing:
-            out = torch.flip(out, dims=[0])
+        # if reverse_processing:
+        #     out = torch.flip(out, dims=[0])
 
         # reference_repeat = reference_image.repeat((num_frames, 1,1,1)) 
         # out = colormatch(reference_repeat, out) #do one more color match #is this the problem? 
