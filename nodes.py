@@ -3904,7 +3904,7 @@ class WanVideoChainedSampler:
                 chunk = run_chunk(start, end, key_frames, control_frames, forward=True, overlap_images=forward_overlap_images)
 
                 # Save the last frame to be reused in the next forward pass
-                overlap_images = chunk[size-overlap_frames:] #TODO cache the overlap frames 
+                forward_overlap_images = chunk[size-overlap_frames:] #TODO cache the overlap frames 
 
                 forward_chunks.append(chunk)
 
