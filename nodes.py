@@ -3830,13 +3830,15 @@ class WanVideoChainedSampler:
                 tile_stride_y=128
             )[0]
 
-            frame_count = decoded_images.shape[0]
-            reference_repeat = reference_image.repeat((original_count, 1,1,1))
 
             decoded_images = trim_batch(decoded_images, original_count)
 
-            if color_match:
-                decoded_images = colormatch(reference_repeat, decoded_images) #before you return the trim you should color correct it based on the reference image 
+            if color_match and overlap_images is not None:
+                # avg the overlap images
+                color_reference = overlap_images[-1:] #this should maybe be the first frame if Forward is false (nearest frame )
+                # color_reference = overlap_images.mean(dim=0, keepdim=True)  # [1, C, H, W]
+                color_reference_repeat = color_reference.repeat((original_count, 1,1,1))
+                decoded_images = colormatch(color_reference_repeat, decoded_images)
 
             return decoded_images
 
@@ -3847,6 +3849,8 @@ class WanVideoChainedSampler:
         if num_frames <= max_frames_per_chunk:
             out = run_chunk(0, num_frames - 1, key_frames, control_frames)
         else:
+            #color match is only necessary if you are chaining
+
             chunks = []
             
             #backward chunks 
