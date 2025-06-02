@@ -3729,17 +3729,6 @@ class WanVideoChainedSampler:
 
         keyframe_index_list = [int(i) for i in keyframe_indices.split(",")]
 
-        if reverse_processing:
-            control_frames = torch.flip(control_frames, dims=[0])
-            keyframe_index_list = [num_frames - 1 - i for i in keyframe_index_list]
-
-
-        if perfect_loop:
-            keyframe_index_list.append(num_frames)  
-            num_frames += 1 
-            key_frames = torch.cat([key_frames, key_frames[0].unsqueeze(0)], dim=0)  # Add the image
-            control_frames = torch.cat([control_frames, control_frames[0].unsqueeze(0)], dim=0)
-
         #here i want to add some code in that makes this a perfect loop    
         # i think the best way to do this is to take the first keyframe and add it to the keyframe system w/ it being "num_frames" and then also concat 1 more control to the end 
 
@@ -3883,7 +3872,14 @@ class WanVideoChainedSampler:
             forward_overlap_images = None 
 
             forward_overlap_frames = 0
+
+            loop_frame = key_frames[0]
+
             if (f_start > 0):
+                # this is the case where you had a backward chunk  
+                # in this case the loop_frame should be the very first frame of the last backward chunk
+                loop_frame = backward_chunks[0][0]
+
                 # in this case you want to build up to f_start from the overlap 
                 # however in this case it may not mean that there are "overlap_frames" to work with it could be less 
                 # so you want to check if the backward chunks are actually enough to work with
@@ -3892,6 +3888,13 @@ class WanVideoChainedSampler:
                 f_start = f_start - forward_overlap_frames + 1 #i think... 
  
                 forward_overlap_images = backward_chunks[-1][-forward_overlap_frames:] #set the forward overlap images to the last backward chunk 
+
+
+            if perfect_loop:
+                keyframe_index_list.append(num_frames)  
+                num_frames += 1
+                key_frames = torch.cat([key_frames, loop_frame.unsqueeze(0)], dim=0)  # Add the image
+                control_frames = torch.cat([control_frames, control_frames[0].unsqueeze(0)], dim=0)
 
             first_run = True
 
@@ -3932,9 +3935,7 @@ class WanVideoChainedSampler:
 
         if perfect_loop:
             out = out[:-1]  # Remove the last frame
-        
-        # if reverse_processing:
-        #     out = torch.flip(out, dims=[0])
+
 
         # reference_repeat = reference_image.repeat((num_frames, 1,1,1)) 
         # out = colormatch(reference_repeat, out) #do one more color match #is this the problem? 
