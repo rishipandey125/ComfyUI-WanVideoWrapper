@@ -3995,6 +3995,399 @@ class WanVideoEncode:
  
         return ({"samples": latents, "mask": latent_mask},)
 
+
+class WanVideoChainedSampler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "vae": ("WANVAE",),
+                "model": ("WANVIDEOMODEL",),
+                "text_embeds": ("WANVIDEOTEXTEMBEDS", ),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
+                "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 1, "tooltip": "Number of frames to encode"}),
+                "max_frames_per_chunk": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 1, "tooltip": "Number of frames per chunk"}),
+                "reverse_processing": ("BOOLEAN", {"default": False, "tooltip": "Reverse the processing order of the video"}),
+                "perfect_loop": ("BOOLEAN", {"default": False, "tooltip": "makes the video loop perfectly"}),
+                "control_frames": ("IMAGE",),
+                "key_frames": ("IMAGE",),           
+                "reference_image": ("IMAGE",),
+                "keyframe_indices": ("STRING", {"default": ""}),
+                "cn_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "i2v_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "vace_percentage": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "steps": ("INT", {"default": 5, "min": 1}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.01}),
+                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "force_offload": ("BOOLEAN", {"default": True}),
+                "scheduler": (["unipc", "unipc/beta", "dpm++", "dpm++/beta","dpm++_sde", "dpm++_sde/beta", "euler", "euler/beta","euler/accvideo", "deis", "lcm", "lcm/beta", "flowmatch_causvid"], {"default": 'unipc'}),
+                "riflex_freq_index": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1}),
+                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "batched_cfg": ("BOOLEAN", {"default": False}),
+                "rope_function": (["default", "comfy"], {"default": "comfy"}),
+                "overlap_frames": ("INT", {"default": 4, "min": 0, "max": 20, "step": 1}),
+                "model_reference": ("BOOLEAN", {"default": False}),
+                "color_match": ("BOOLEAN", {"default": True}),
+                "color_match_method": (
+                    [   
+                        'mkl',
+                        'hm', 
+                        'reinhard', 
+                        'mvgd', 
+                        'hm-mvgd-hm', 
+                        'hm-mkl-hm',
+                    ], {
+                    "default": 'mkl'
+                    }),
+            },
+        }
+    # RETURN_TYPES = ("LATENT",)
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+
+    def process(self, vae, model, text_embeds, width, height, num_frames, max_frames_per_chunk, reverse_processing, perfect_loop, control_frames, key_frames, reference_image, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames, model_reference, color_match, color_match_method):
+
+        # need this color match func to work 
+        def colormatch(image_ref, image_target, strength=1.0):
+            method = color_match_method
+
+            try:
+                from color_matcher import ColorMatcher
+            except:
+                raise Exception("Can't import color-matcher, did you install requirements.txt? Manual install: pip install color-matcher")
+            cm = ColorMatcher()
+            image_ref = image_ref.cpu()
+            image_target = image_target.cpu()
+            batch_size = image_target.size(0)
+            out = []
+            images_target = image_target.squeeze()
+            images_ref = image_ref.squeeze()
+
+            image_ref_np = images_ref.numpy()
+            images_target_np = images_target.numpy()
+
+            if image_ref.size(0) > 1 and image_ref.size(0) != batch_size:
+                raise ValueError("ColorMatch: Use either single reference image or a matching batch of reference images.")
+
+            for i in range(batch_size):
+                image_target_np = images_target_np if batch_size == 1 else images_target[i].numpy()
+                image_ref_np_i = image_ref_np if image_ref.size(0) == 1 else images_ref[i].numpy()
+                try:
+                    image_result = cm.transfer(src=image_target_np, ref=image_ref_np_i, method=method)
+                except BaseException as e:
+                    print(f"Error occurred during transfer: {e}")
+                    break
+                # Apply the strength multiplier
+                image_result = image_target_np + strength * (image_result - image_target_np)
+                out.append(torch.from_numpy(image_result))
+                
+            out = torch.stack(out, dim=0).to(torch.float32)
+            out.clamp_(0, 1)
+            return out
+    
+        def pad_batch(images):
+            # Get the current batch size
+            current_size = images.shape[0]
+            
+            # Calculate the next 4n+1 size
+            n = math.ceil((current_size - 1) / 4)
+            target_size = 4 * n + 1
+            
+            # If we're already at a 4n+1 size, return as is
+            if current_size == target_size:
+                return (images, current_size, target_size)
+                
+            # Calculate how many frames we need to pad
+            padding_size = target_size - current_size
+            
+            # Get the last frame to repeat
+            last_frame = images[-1]
+            
+            # Create the padding frames by repeating the last frame
+            padding_frames = last_frame.unsqueeze(0).repeat(padding_size, 1, 1, 1)
+            
+            # Concatenate the original frames with the padding frames
+            padded_images = torch.cat([images, padding_frames], dim=0)
+            
+            return padded_images, current_size, target_size
+        
+        def trim_batch(images, original_count):
+            # Ensure original_count is not larger than the current batch size
+            original_count = min(original_count, images.shape[0])
+            
+            # Trim the batch to the original size
+            trimmed_images = images[:original_count]
+            
+            return trimmed_images
+        
+        def create_frame_sequence(num_frames, keyframe_index_list, keyframe_images, control_frames=None, inpaint_mask=None, empty_frame_level=0.5):
+            device = keyframe_images.device
+            H, W = keyframe_images.shape[1:3]
+
+            masks = torch.ones((num_frames, H, W), device=device)
+
+            if control_frames is not None: 
+                control_frames = common_upscale(control_frames.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(1, -1)
+            
+            # Create empty frames 
+            if control_frames is None: 
+                frames = torch.ones((num_frames, H, W, 3), device=device) * empty_frame_level
+            else: 
+                frames = control_frames[:num_frames]
+
+            slot_indices = [] 
+            for idx, slot_index in enumerate(keyframe_index_list):
+                
+                slot_indices.append(slot_index)
+                # Get the corresponding keyframe image from the batch
+                slot_image = keyframe_images[idx:idx+1]  # Keep batch dimension
+                # Replace the frame at slot_index with slot_image
+                frames[slot_index:slot_index + slot_image.shape[0]] = slot_image
+                
+                # Create mask for the slot image
+                masks[slot_index:slot_index + slot_image.shape[0]] = 0
+
+                if inpaint_mask is not None:
+                    inpaint_mask = common_upscale(inpaint_mask.unsqueeze(1), W, H, "nearest-exact", "disabled").squeeze(1).to(device)
+                    if inpaint_mask.shape[0] > num_frames:
+                        inpaint_mask = inpaint_mask[:num_frames]
+                    elif inpaint_mask.shape[0] < num_frames:
+                        inpaint_mask = inpaint_mask.repeat(num_frames // inpaint_mask.shape[0] + 1, 1, 1)[:num_frames]
+
+                    empty_mask = torch.ones_like(masks, device=device)
+                    masks = inpaint_mask * empty_mask
+
+            return frames.cpu().float(), masks.cpu().float()
+        
+
+        strength_v2v = cn_strength
+        strength_i2v = i2v_strength  
+        percentage = vace_percentage
+
+        keyframe_index_list = [int(i) for i in keyframe_indices.split(",")]
+
+        #here i want to add some code in that makes this a perfect loop    
+        # i think the best way to do this is to take the first keyframe and add it to the keyframe system w/ it being "num_frames" and then also concat 1 more control to the end 
+
+
+        first_keyframe = min(keyframe_index_list)
+
+        def run_chunk(start, end, key_frames, control_frames, forward=True, overlap_images=None):
+            sub_keyframes = []
+            sub_key_images = []
+
+            for i, k in enumerate(keyframe_index_list):
+                if start <= k <= end:
+                    sub_keyframes.append(k - start)
+                    sub_key_images.append(key_frames[i])
+
+            sub_key_images = torch.stack(sub_key_images) if sub_key_images else torch.empty((0, height, width, 3), device=control_frames.device)
+
+            if overlap_images is not None:
+                #there may be collisions in the keyframes here - i wonder how much that matters? 
+
+                # here we may need to end the batch in the overlap images instead of starting it if it is backwards 
+                if not forward: 
+                    sub_key_images = torch.cat([sub_key_images, overlap_images], dim=0)
+                    overlap_indices = list(range(sub_key_images.shape[0] - overlap_images.shape[0], sub_key_images.shape[0]))
+                    sub_keyframes = sub_keyframes + overlap_indices
+                else:
+                    sub_key_images = torch.cat([overlap_images, sub_key_images], dim=0)
+                # Add corresponding indices for overlap images
+                    overlap_indices = list(range(overlap_images.shape[0]))
+                    sub_keyframes = overlap_indices + sub_keyframes
+
+
+            print("RUN CHUNK")
+            print("Start: " + str(start))
+            print("End: " + str(end))
+            print("Keyframe Indices...")
+            print(sub_keyframes)
+
+            chunk_control = control_frames[start:end+1]
+            chunk_control, original_count, padded_count = pad_batch(chunk_control)
+
+            print("Original Count: " + str(original_count))
+
+            print("Chunk Count: " + str(padded_count))
+
+            cn_frames, mask = create_frame_sequence(padded_count, sub_keyframes, sub_key_images, chunk_control)
+            i2v_frames, i2v_mask  = create_frame_sequence(padded_count, sub_keyframes, sub_key_images)
+
+            cn_image_embeds = WanVideoVACEEncode().process(
+                vae=vae,
+                width=width,
+                height=height,
+                num_frames=padded_count,
+                strength=strength_v2v,
+                vace_start_percent=0.0,
+                vace_end_percent=percentage,
+                input_frames=cn_frames,
+                input_masks=mask,
+                ref_images=None if not model_reference else reference_image,
+            )[0]
+
+            i2v_image_embeds = WanVideoVACEEncode().process(
+                vae=vae,
+                width=width,
+                height=height,
+                num_frames=padded_count,
+                strength=strength_i2v,
+                vace_start_percent=0.0,
+                vace_end_percent=percentage,
+                input_frames=i2v_frames,
+                input_masks=mask,
+                prev_vace_embeds=cn_image_embeds,
+                ref_images=None if not model_reference else reference_image,
+            )[0]
+
+            samples = WanVideoSampler().process(
+                model=model,
+                text_embeds=text_embeds,
+                image_embeds=i2v_image_embeds,
+                steps=steps,
+                cfg=cfg,
+                shift=shift,
+                seed=seed,
+                force_offload=force_offload,
+                scheduler=scheduler,
+                riflex_freq_index=riflex_freq_index,
+                denoise_strength=denoise_strength,
+                batched_cfg=batched_cfg,
+                rope_function=rope_function
+            )
+
+            decoded_images = WanVideoDecode().decode(
+                vae=vae,
+                samples=samples[0],
+                enable_vae_tiling=False,
+                tile_x=272,
+                tile_y=272,
+                tile_stride_x=144,
+                tile_stride_y=128
+            )[0]
+
+
+            decoded_images = trim_batch(decoded_images, original_count)
+
+            if color_match and overlap_images is not None:
+                # avg the overlap images
+                color_reference = overlap_images[-1:] #this should maybe be the first frame if Forward is false (nearest frame )
+                # color_reference = overlap_images.mean(dim=0, keepdim=True)  # [1, C, H, W]
+                color_reference_repeat = color_reference.repeat((original_count, 1,1,1))
+                decoded_images = colormatch(color_reference_repeat, decoded_images)
+
+            return decoded_images
+
+        print("CREATING VIDEO")
+        print("Keyframe Indices...")
+        print(keyframe_index_list)
+
+        if num_frames <= max_frames_per_chunk:
+            out = run_chunk(0, num_frames - 1, key_frames, control_frames)
+        else:
+            #color match is only necessary if you are chaining
+
+            chunks = []
+            
+            #backward chunks 
+            backward_chunks = []    
+            b_start = first_keyframe #this is where you should split b/w forward and backward chunks 
+
+            backward_overlap_images = None
+            while b_start > 0: # once b_start is 0 you are on the last chunk 
+                size = min(max_frames_per_chunk, b_start + 1)
+                start = max(0, b_start - size + 1)
+                end = b_start
+
+                chunk = run_chunk(start, end, key_frames, control_frames, forward=False, overlap_images=backward_overlap_images)
+                backward_overlap_images = chunk[:overlap_frames] #TODO cache the overlap frames 
+
+                backward_chunks.insert(0, chunk)
+                b_start -= size - 1 
+
+            #forward chunks 
+            forward_chunks = []
+            f_start = first_keyframe
+
+            forward_overlap_images = None 
+
+            forward_overlap_frames = 0
+
+            loop_frame = key_frames[0]
+
+            if (f_start > 0):
+                # this is the case where you had a backward chunk  
+                # in this case the loop_frame should be the very first frame of the last backward chunk
+                loop_frame = backward_chunks[0][0]
+
+                # in this case you want to build up to f_start from the overlap 
+                # however in this case it may not mean that there are "overlap_frames" to work with it could be less 
+                # so you want to check if the backward chunks are actually enough to work with
+                forward_overlap_frames = min(backward_chunks[-1].shape[0], overlap_frames)
+
+                f_start = f_start - forward_overlap_frames + 1 #i think... 
+ 
+                forward_overlap_images = backward_chunks[-1][-forward_overlap_frames:] #set the forward overlap images to the last backward chunk 
+
+
+            if perfect_loop:
+                keyframe_index_list.append(num_frames)  
+                num_frames += 1
+                key_frames = torch.cat([key_frames, loop_frame.unsqueeze(0)], dim=0)  # Add the image
+                control_frames = torch.cat([control_frames, control_frames[0].unsqueeze(0)], dim=0)
+
+            first_run = True
+
+            while f_start < num_frames - 1: #this makes sense since we are checking if the index we should render from is valid in the range 
+                size = min(max_frames_per_chunk, num_frames - f_start) #this is basically determining if we are on last chunk or not 
+
+                start = f_start
+                end = min(f_start + size - 1, num_frames - 1) #this is basically determing end of the curr chunk 
+
+                chunk = run_chunk(start, end, key_frames, control_frames, forward=True, overlap_images=forward_overlap_images)
+
+                # Save the last frame to be reused in the next forward pass
+                forward_overlap_images = chunk[size-overlap_frames:] #TODO cache the overlap frames 
+
+                forward_chunks.append(chunk)
+
+                f_start += size - overlap_frames  # LGTM
+
+                if size < max_frames_per_chunk:
+                    break
+
+            # Trim overlaps
+            trimmed_chunks = []
+            for i, chunk in enumerate(backward_chunks):
+                if i < len(backward_chunks) - 1:
+                    trimmed_chunks.append(chunk[:-overlap_frames])  # trim tail
+                else:
+                    trimmed_chunks.append(chunk)       # last backward chunk (ends at anchor)
+
+            for i, chunk in enumerate(forward_chunks):
+                if i == 0:
+                    trimmed_chunks.append(chunk[forward_overlap_frames:])       # first forward chunk (starts at anchor)
+                else:
+                    trimmed_chunks.append(chunk[overlap_frames:])   # trim head
+
+            out = torch.cat(trimmed_chunks, dim=0)
+
+
+        if perfect_loop:
+            out = out[:-1]  # Remove the last frame
+
+
+        # reference_repeat = reference_image.repeat((num_frames, 1,1,1)) 
+        # out = colormatch(reference_repeat, out) #do one more color match #is this the problem? 
+        
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
     "WanVideoDecode": WanVideoDecode,
@@ -4035,7 +4428,8 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoRealisDanceLatents": WanVideoRealisDanceLatents,
     "WanVideoApplyNAG": WanVideoApplyNAG,
     "WanVideoMiniMaxRemoverEmbeds": WanVideoMiniMaxRemoverEmbeds,
-    "WanVideoLoraSelectMulti": WanVideoLoraSelectMulti
+    "WanVideoLoraSelectMulti": WanVideoLoraSelectMulti,
+    "WanVideoChainedSampler": WanVideoChainedSampler
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -4078,5 +4472,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoRealisDanceLatents": "WanVideo RealisDance Latents",
     "WanVideoApplyNAG": "WanVideo Apply NAG",
     "WanVideoMiniMaxRemoverEmbeds": "WanVideo MiniMax Remover Embeds",
-    "WanVideoLoraSelectMulti": "WanVideo Lora Select Multi"
+    "WanVideoLoraSelectMulti": "WanVideo Lora Select Multi",
+    "WanVideoChainedSampler": "WanVideo Chained Sampler"
     }
