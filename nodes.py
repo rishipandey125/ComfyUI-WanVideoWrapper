@@ -4042,6 +4042,10 @@ class WanVideoChainedSampler:
                     "default": 'mkl'
                     }),
             },
+            "optional": {
+                "slg_args": ("SLGARGS", ),
+                "experimental_args": ("EXPERIMENTALARGS", ),
+            },
         }
     # RETURN_TYPES = ("LATENT",)
     RETURN_TYPES = ("IMAGE",)
@@ -4049,7 +4053,7 @@ class WanVideoChainedSampler:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, vae, model, text_embeds, width, height, num_frames, max_frames_per_chunk, reverse_processing, perfect_loop, control_frames, key_frames, reference_image, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames, model_reference, color_match, color_match_method):
+    def process(self, vae, model, text_embeds, width, height, num_frames, max_frames_per_chunk, reverse_processing, perfect_loop, control_frames, key_frames, reference_image, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames, model_reference, color_match, color_match_method, slg_args=None, experimental_args=None):
 
         # need this color match func to work 
         def colormatch(image_ref, image_target, strength=1.0):
@@ -4258,7 +4262,9 @@ class WanVideoChainedSampler:
                 riflex_freq_index=riflex_freq_index,
                 denoise_strength=denoise_strength,
                 batched_cfg=batched_cfg,
-                rope_function=rope_function
+                rope_function=rope_function,
+                slg_args=slg_args,
+                experimental_args=experimental_args
             )
 
             decoded_images = WanVideoDecode().decode(
