@@ -4191,14 +4191,15 @@ class WanVideoChainedSampler:
 
             sub_key_images = torch.stack(sub_key_images) if sub_key_images else torch.empty((0, height, width, 3), device=control_frames.device)
 
+            num_frames = end - start + 1
             if overlap_images is not None:
                 #there may be collisions in the keyframes here - i wonder how much that matters? 
 
                 # here we may need to end the batch in the overlap images instead of starting it if it is backwards 
                 if not forward: 
                     sub_key_images = torch.cat([sub_key_images, overlap_images], dim=0)
-                    overlap_indices = list(range(sub_key_images.shape[0] - overlap_images.shape[0], sub_key_images.shape[0]))
-                    sub_keyframes = sub_keyframes + overlap_indices
+                    overlap_indices = list(range(num_frames - overlap_images.shape[0], num_frames))
+                    sub_keyframes = sub_keyframes + overlap_indices #this is the problem 
                 else:
                     sub_key_images = torch.cat([overlap_images, sub_key_images], dim=0)
                 # Add corresponding indices for overlap images
@@ -4281,8 +4282,11 @@ class WanVideoChainedSampler:
             decoded_images = trim_batch(decoded_images, original_count)
 
             if color_match and overlap_images is not None:
-                # avg the overlap images
-                color_reference = overlap_images[-1:] #this should maybe be the first frame if Forward is false (nearest frame )
+                if forward: 
+                    color_reference = overlap_images[-1:]
+                else:
+                    color_reference = overlap_images[0:1]
+
                 # color_reference = overlap_images.mean(dim=0, keepdim=True)  # [1, C, H, W]
                 color_reference_repeat = color_reference.repeat((original_count, 1,1,1))
                 decoded_images = colormatch(color_reference_repeat, decoded_images)
@@ -4305,20 +4309,32 @@ class WanVideoChainedSampler:
             b_start = first_keyframe #this is where you should split b/w forward and backward chunks 
 
             backward_overlap_images = None
+
+            went_backwards = True
+
+            if b_start < max_frames_per_chunk:
+                b_start = 0
+                went_backwards = False
+
             while b_start > 0: # once b_start is 0 you are on the last chunk 
                 size = min(max_frames_per_chunk, b_start + 1)
-                start = max(0, b_start - size + 1)
+                start = max(0, b_start - size + 1) #TODO is this correct? 
                 end = b_start
 
                 chunk = run_chunk(start, end, key_frames, control_frames, forward=False, overlap_images=backward_overlap_images)
-                backward_overlap_images = chunk[:overlap_frames] #TODO cache the overlap frames 
-
+                # For backward processing, we want the first frames of the chunk for overlap with the next chunk
+                backward_overlap_images = chunk[:overlap_frames] #TODO cache the overlap frames
                 backward_chunks.insert(0, chunk)
                 b_start -= size - 1 
 
             #forward chunks 
             forward_chunks = []
-            f_start = first_keyframe
+
+            # Set f_start based on whether we went backwards or not
+            if went_backwards:
+                f_start = first_keyframe
+            else:
+                f_start = 0  # Start from beginning if no backward processing
 
             forward_overlap_images = None 
 
@@ -4326,7 +4342,7 @@ class WanVideoChainedSampler:
 
             loop_frame = key_frames[0]
 
-            if (f_start > 0):
+            if (went_backwards): 
                 # this is the case where you had a backward chunk  
                 # in this case the loop_frame should be the very first frame of the last backward chunk
                 loop_frame = backward_chunks[0][0]
