@@ -4317,15 +4317,17 @@ class WanVideoChainedSampler:
                 went_backwards = False
 
             while b_start > 0: # once b_start is 0 you are on the last chunk 
+                # todo the backward chunk isn't overlapping correctly 
                 size = min(max_frames_per_chunk, b_start + 1)
-                start = max(0, b_start - size + 1) #TODO is this correct? 
+                start = max(0, b_start - size + 1)
                 end = b_start
 
                 chunk = run_chunk(start, end, key_frames, control_frames, forward=False, overlap_images=backward_overlap_images)
                 # For backward processing, we want the first frames of the chunk for overlap with the next chunk
-                backward_overlap_images = chunk[:overlap_frames] #TODO cache the overlap frames
-                backward_chunks.insert(0, chunk)
-                b_start -= size - 1 
+                backward_overlap_images = chunk[:overlap_frames]
+                backward_chunks.insert(0, chunk) 
+                b_start -= start + overlap_frames - 1 
+
 
             #forward chunks 
             forward_chunks = []
@@ -4374,11 +4376,11 @@ class WanVideoChainedSampler:
                 chunk = run_chunk(start, end, key_frames, control_frames, forward=True, overlap_images=forward_overlap_images)
 
                 # Save the last frame to be reused in the next forward pass
-                forward_overlap_images = chunk[size-overlap_frames:] #TODO cache the overlap frames 
+                forward_overlap_images = chunk[size-overlap_frames:]  
 
                 forward_chunks.append(chunk)
 
-                f_start += size - overlap_frames  # LGTM
+                f_start += size - overlap_frames  
 
                 if size < max_frames_per_chunk:
                     break
@@ -4387,12 +4389,12 @@ class WanVideoChainedSampler:
             trimmed_chunks = []
             for i, chunk in enumerate(backward_chunks):
                 if i < len(backward_chunks) - 1:
-                    trimmed_chunks.append(chunk[:-overlap_frames])  # trim tail
+                    trimmed_chunks.append(chunk[:-overlap_frames]) 
                 else:
                     trimmed_chunks.append(chunk)       # last backward chunk (ends at anchor)
 
             for i, chunk in enumerate(forward_chunks):
-                if i == 0:
+                if i == 0: #this could be an issue 
                     trimmed_chunks.append(chunk[forward_overlap_frames:])       # first forward chunk (starts at anchor)
                 else:
                     trimmed_chunks.append(chunk[overlap_frames:])   # trim head
