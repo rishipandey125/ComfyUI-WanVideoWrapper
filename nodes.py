@@ -4325,8 +4325,11 @@ class WanVideoChainedSampler:
                 chunk = run_chunk(start, end, key_frames, control_frames, forward=False, overlap_images=backward_overlap_images)
                 # For backward processing, we want the first frames of the chunk for overlap with the next chunk
                 backward_overlap_images = chunk[:overlap_frames]
-                backward_chunks.insert(0, chunk) 
-                b_start -= start + overlap_frames - 1 
+                backward_chunks.insert(0, chunk)
+                if (start != 0):
+                    b_start = start + overlap_frames - 1 
+                else:
+                    b_start = 0 
 
 
             #forward chunks 
