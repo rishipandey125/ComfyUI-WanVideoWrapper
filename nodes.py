@@ -4008,6 +4008,8 @@ class WanVideoChainedSampler:
                 "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
                 "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 1, "tooltip": "Number of frames to encode"}),
                 "max_frames_per_chunk": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 1, "tooltip": "Number of frames per chunk"}),
+                "blueprint_window": ("INT", {"default": 37, "min": 5, "max": 200, "step": 1, "tooltip": "Number of frames for the blueprint pass, helps with motion between distant keyframes"}),
+                "blueprint_only": ("BOOLEAN", {"default": False, "tooltip": "Return only the blueprint frames for debugging"}),
                 "reverse_processing": ("BOOLEAN", {"default": False, "tooltip": "Reverse the processing order of the video"}),
                 "perfect_loop": ("BOOLEAN", {"default": False, "tooltip": "makes the video loop perfectly"}),
                 "control_frames": ("IMAGE",),
@@ -4053,7 +4055,7 @@ class WanVideoChainedSampler:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, vae, model, text_embeds, width, height, num_frames, max_frames_per_chunk, reverse_processing, perfect_loop, control_frames, key_frames, reference_image, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames, model_reference, color_match, color_match_method, slg_args=None, experimental_args=None):
+    def process(self, vae, model, text_embeds, width, height, num_frames, max_frames_per_chunk, blueprint_window, blueprint_only, reverse_processing, perfect_loop, control_frames, key_frames, reference_image, keyframe_indices, cn_strength, i2v_strength, vace_percentage, steps, cfg, shift, seed, force_offload, scheduler, riflex_freq_index, denoise_strength, batched_cfg, rope_function, overlap_frames, model_reference, color_match, color_match_method, slg_args=None, experimental_args=None):
 
         # need this color match func to work 
         def colormatch(image_ref, image_target, strength=1.0):
@@ -4312,10 +4314,10 @@ class WanVideoChainedSampler:
             non_keyframe_indices = [i for i in all_original_indices if i not in unique_keyframe_indices]
 
             num_keyframes = len(unique_keyframe_indices)
-            num_non_keyframes_to_sample = max_frames_per_chunk - num_keyframes
+            num_non_keyframes_to_sample = blueprint_window - num_keyframes
 
             if num_non_keyframes_to_sample < 0:
-                raise ValueError(f"Blueprint generation failed: Number of keyframes ({num_keyframes}) is greater than max_frames_per_chunk ({max_frames_per_chunk}).")
+                raise ValueError(f"Blueprint generation failed: Number of keyframes ({num_keyframes}) is greater than the blueprint_window ({blueprint_window}).")
             
             if len(non_keyframe_indices) > 0 and num_non_keyframes_to_sample > 0:
                 sampled_indices_from_non_keyframes = np.linspace(0, len(non_keyframe_indices) - 1, num_non_keyframes_to_sample, dtype=int)
@@ -4347,11 +4349,12 @@ class WanVideoChainedSampler:
                 override_keyframe_indices=blueprint_keyframe_indices
             )
             
-            return (blueprint_images,)
+            if blueprint_only:
+                return (blueprint_images,)
 
             # Pass 2: Setup for the detail pass using the blueprint as new keyframes
             print("Setting up detail pass using blueprint as keyframes...")
-            key_frames = blueprint_images #this makes sense
+            key_frames = blueprint_images
             keyframe_index_list = blueprint_original_indices 
             
             first_keyframe = min(keyframe_index_list) # Update first_keyframe for the detail pass
