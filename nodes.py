@@ -4195,6 +4195,9 @@ class WanVideoChainedSampler:
 
             sub_key_images = torch.stack(sub_key_images) if sub_key_images else torch.empty((0, height, width, 3), device=control_frames.device)
 
+            # Store keyframes for this chunk before they are modified by overlap
+            chunk_ref_images = sub_key_images.clone() if sub_key_images.nelement() > 0 else None
+
             num_frames_chunk = end - start + 1
             if overlap_images is not None:
                 #there may be collisions in the keyframes here - i wonder how much that matters? 
@@ -4224,6 +4227,14 @@ class WanVideoChainedSampler:
 
             print("Chunk Count: " + str(padded_count))
 
+            # Determine the single reference image for this chunk
+            chunk_ref_image = None
+            if model_reference:
+                if chunk_ref_images is not None:
+                    chunk_ref_image = chunk_ref_images[0:1]  # Use the first keyframe of the chunk
+                else:
+                    chunk_ref_image = reference_image # Fallback to the global one
+
             cn_frames, mask = create_frame_sequence(padded_count, sub_keyframes, sub_key_images, chunk_control)
             i2v_frames, i2v_mask  = create_frame_sequence(padded_count, sub_keyframes, sub_key_images)
 
@@ -4237,7 +4248,7 @@ class WanVideoChainedSampler:
                 vace_end_percent=percentage,
                 input_frames=cn_frames,
                 input_masks=mask,
-                ref_images=None if not model_reference else reference_image,
+                ref_images=chunk_ref_image,
             )[0]
 
             i2v_image_embeds = WanVideoVACEEncode().process(
@@ -4251,7 +4262,7 @@ class WanVideoChainedSampler:
                 input_frames=i2v_frames,
                 input_masks=mask,
                 prev_vace_embeds=cn_image_embeds,
-                ref_images=None if not model_reference else reference_image,
+                ref_images=chunk_ref_image,
             )[0]
 
             samples = WanVideoSampler().process(
