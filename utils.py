@@ -2,6 +2,7 @@ import importlib.metadata
 import torch
 import logging
 from tqdm import tqdm
+from comfy.utils import ProgressBar
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
@@ -32,6 +33,10 @@ def get_module_memory_mb(module):
             memory += param.nelement() * param.element_size()
     return memory / (1024 * 1024)  # Convert to MB
 
+def get_tensor_memory(tensor):
+    memory_bytes = tensor.element_size() * tensor.nelement()
+    return f"{memory_bytes / (1024 * 1024):.2f} MB"
+
 def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, dtype=None, base_dtype=None, state_dict=None, low_mem_load=False):
         to_load = []
         for n, m in model.model.named_modules():
@@ -47,6 +52,7 @@ def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, d
                 to_load.append((n, m, params))
 
         to_load.sort(reverse=True)
+        pbar = ProgressBar(len(to_load))
         for x in tqdm(to_load, desc="Loading model and applying LoRA weights:", leave=True):
             name = x[0]
             m = x[1]
@@ -67,13 +73,17 @@ def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, d
                         set_module_tensor_to_device(model.model.diffusion_model, key, device=transformer_load_device, dtype=dtype_to_use, value=state_dict[key])
                     except:
                         continue
-                model.patch_weight_to_device("{}.{}".format(name, param), device_to=device_to)
+                if low_mem_load:
+                    model.patch_weight_to_device("{}.{}".format(name, param), device_to=device_to, inplace_update=True)
+                else:
+                    model.patch_weight_to_device("{}.{}".format(name, param), device_to=device_to)
                 if low_mem_load:
                     try:
                         set_module_tensor_to_device(model.model.diffusion_model, key, device=transformer_load_device, dtype=dtype_to_use, value=model.model.diffusion_model.state_dict()[key])
                     except:
                         continue
             m.comfy_patched_weights = True
+            pbar.update(1)
       
         model.current_weight_patches_uuid = model.patches_uuid
         if low_mem_load:
@@ -226,3 +236,28 @@ def fourier_filter(x, scale_low=1.0, scale_high=1.5, freq_cutoff=20):
     x_filtered = x_filtered.to(dtype)
 
     return x_filtered
+
+def is_image_black(image, threshold=1e-3):
+    if image.min() < 0:
+        image = (image + 1) / 2
+    return torch.all(image < threshold).item()
+
+def add_noise_to_reference_video(image, ratio=None):
+    sigma = torch.ones((image.shape[0],)).to(image.device, image.dtype) * ratio 
+    image_noise = torch.randn_like(image) * sigma[:, None, None, None]
+    image_noise = torch.where(image==-1, torch.zeros_like(image), image_noise)
+    image = image + image_noise
+    return image
+
+def optimized_scale(positive_flat, negative_flat):
+
+    # Calculate dot production
+    dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
+
+    # Squared norm of uncondition
+    squared_norm = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
+
+    # st_star = v_cond^T * v_uncond / ||v_uncond||^2
+    st_star = dot_product / squared_norm
+    
+    return st_star
