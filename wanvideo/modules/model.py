@@ -28,8 +28,7 @@ from tqdm import tqdm
 import gc
 import comfy.model_management as mm
 from ...utils import log, get_module_memory_mb
-from ...cache_methods.cache_methods import TeaCacheState, MagCacheState, EasyCacheState, relative_l1_distance
-from ..radial_attention.attn_mask import MaskMap
+
 from ...multitalk.multitalk import get_attn_map_with_target
 
 from comfy.ldm.flux.math import apply_rope as apply_rope_comfy
@@ -1451,8 +1450,6 @@ class WanModel(ModelMixin, ConfigMixin):
             attn_cond = attn_cond.flatten(2).transpose(1, 2)
             x[0] = torch.cat([x[0], attn_cond], dim=1)
             seq_len += attn_cond.size(1)
-            for block in self.blocks:
-                block.self_attn.mask_map = MaskMap(video_token_num=seq_len, num_frame=F+1)
 
         if self.ref_conv is not None and fun_ref is not None:
             fun_ref = self.ref_conv(fun_ref).flatten(2).transpose(1, 2)
@@ -1870,3 +1867,110 @@ class WanModel(ModelMixin, ConfigMixin):
             u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
             out.append(u)
         return out
+
+class TeaCacheState:
+    def __init__(self, cache_device='cpu'):
+        self.cache_device = cache_device
+        self.states = {}
+        self._next_pred_id = 0
+    
+    def new_prediction(self, cache_device='cpu'):
+        """Create new prediction state and return its ID"""
+        self.cache_device = cache_device
+        pred_id = self._next_pred_id
+        self._next_pred_id += 1
+        self.states[pred_id] = {
+            'previous_residual': None,
+            'accumulated_rel_l1_distance': 0,
+            'previous_modulated_input': None,
+            'skipped_steps': [],
+        }
+        return pred_id
+    
+    def update(self, pred_id, **kwargs):
+        """Update state for specific prediction"""
+        if pred_id not in self.states:
+            return None
+        for key, value in kwargs.items():
+            self.states[pred_id][key] = value
+    
+    def get(self, pred_id):
+        return self.states.get(pred_id, {})
+    
+    def clear_all(self):
+        self.states = {}
+        self._next_pred_id = 0
+
+class MagCacheState:
+    def __init__(self, cache_device='cpu'):
+        self.cache_device = cache_device
+        self.states = {}
+        self._next_pred_id = 0
+    
+    def new_prediction(self, cache_device='cpu'):
+        """Create new prediction state and return its ID"""
+        self.cache_device = cache_device
+        pred_id = self._next_pred_id
+        self._next_pred_id += 1
+        self.states[pred_id] = {
+            'residual_cache': None,
+            'accumulated_ratio': 1.0,
+            'accumulated_steps': 0,
+            'accumulated_err': 0,
+            'skipped_steps': [],
+        }
+        return pred_id
+    
+    def update(self, pred_id, **kwargs):
+        """Update state for specific prediction"""
+        if pred_id not in self.states:
+            return None
+        for key, value in kwargs.items():
+            self.states[pred_id][key] = value
+    
+    def get(self, pred_id):
+        return self.states.get(pred_id, {})
+    
+    def clear_all(self):
+        self.states = {}
+        self._next_pred_id = 0
+
+class EasyCacheState:
+    def __init__(self, cache_device='cpu'):
+        self.cache_device = cache_device
+        self.states = {}
+        self._next_pred_id = 0
+
+    def new_prediction(self, cache_device='cpu'):
+        """Create a new prediction state and return its ID."""
+        self.cache_device = cache_device
+        pred_id = self._next_pred_id
+        self._next_pred_id += 1
+        self.states[pred_id] = {
+            'previous_raw_input': None,
+            'previous_raw_output': None,
+            'cache': None,
+            'accumulated_error': 0.0,
+            'skipped_steps': [],
+        }
+        return pred_id
+
+    def update(self, pred_id, **kwargs):
+        """Update state for a specific prediction."""
+        if pred_id not in self.states:
+            return None
+        for key, value in kwargs.items():
+            self.states[pred_id][key] = value
+
+    def get(self, pred_id):
+        return self.states.get(pred_id, {})
+
+    def clear_all(self):
+        self.states = {}
+        self._next_pred_id = 0
+
+def relative_l1_distance(last_tensor, current_tensor):
+    l1_distance = torch.abs(last_tensor.to(current_tensor.device) - current_tensor).mean()
+    norm = torch.abs(last_tensor).mean()
+    relative_l1_distance = l1_distance / norm
+    return relative_l1_distance.to(torch.float32).to(current_tensor.device)
